@@ -8,6 +8,9 @@ Covers:
   - Honcho register_cli() builds correct argparse tree
 """
 
+import json
+from pathlib import Path
+import subprocess
 import sys
 from unittest.mock import MagicMock
 
@@ -123,6 +126,78 @@ class TestMemoryPluginCliDiscovery:
             monkeypatch.setattr(pm, "_MEMORY_PLUGINS_DIR", original_dir)
 
         assert len(cmds) == 0
+
+    def test_bundled_honcho_cli_uses_only_path_scoped_dependencies(self):
+        """Honcho CLI discovery must not import its canonical provider package."""
+        script = """
+import json
+from pathlib import Path
+import sys
+
+import plugins.memory as memory_plugins
+
+canonical_root = "plugins.memory.honcho"
+canonical_before = sorted(
+    name
+    for name in sys.modules
+    if name == canonical_root or name.startswith(f"{canonical_root}.")
+)
+memory_plugins._get_active_memory_provider = lambda: "honcho"
+commands = memory_plugins.discover_plugin_cli_commands()
+cli_module = sys.modules.get(commands[0]["setup_fn"].__module__) if commands else None
+cli_package = getattr(cli_module, "__package__", "")
+dependency_name = f"{cli_package}.client"
+dependency = sys.modules.get(dependency_name)
+expected_dependency = (
+    memory_plugins._MEMORY_PLUGINS_DIR / "honcho" / "client.py"
+).resolve()
+try:
+    dependency_origin_matches = (
+        Path(dependency.__file__).resolve() == expected_dependency
+    )
+except (AttributeError, OSError, RuntimeError, TypeError):
+    dependency_origin_matches = False
+helper_module = (
+    commands[0]["setup_fn"].__globals__["_host_block"].__module__
+    if commands
+    else None
+)
+canonical_after = sorted(
+    name
+    for name in sys.modules
+    if name == canonical_root or name.startswith(f"{canonical_root}.")
+)
+print(json.dumps({
+    "canonical_before": canonical_before,
+    "command_count": len(commands),
+    "command_name": commands[0]["name"] if commands else None,
+    "cli_is_path_scoped": cli_package.startswith("_hermes_user_memory_cli_"),
+    "dependency_is_path_scoped": getattr(dependency, "__name__", None) == dependency_name,
+    "dependency_origin_matches": dependency_origin_matches,
+    "helper_uses_path_scoped_dependency": helper_module == dependency_name,
+    "canonical_after": canonical_after,
+}))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[2],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert json.loads(completed.stdout) == {
+            "canonical_before": [],
+            "command_count": 1,
+            "command_name": "honcho",
+            "cli_is_path_scoped": True,
+            "dependency_is_path_scoped": True,
+            "dependency_origin_matches": True,
+            "helper_uses_path_scoped_dependency": True,
+            "canonical_after": [],
+        }
 
 
 # ── Honcho register_cli ──────────────────────────────────────────────────
