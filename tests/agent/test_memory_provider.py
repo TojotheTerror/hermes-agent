@@ -335,6 +335,167 @@ class TestPluginMemoryDiscovery:
         from plugins.memory import load_memory_provider
         assert load_memory_provider("nonexistent_provider") is None
 
+    def test_concurrent_provider_load_waits_for_module_execution(
+        self, tmp_path, monkeypatch
+    ):
+        """Concurrent callers must not reuse a partially executed module."""
+        import plugins.memory as memory_plugins
+        from tests.plugins.loader_test_support import evict_module_tree
+
+        provider_dir = tmp_path / "slowmemory"
+        provider_dir.mkdir()
+        (provider_dir / "__init__.py").write_text(
+            "import time\n"
+            "time.sleep(0.15)\n"
+            "from agent.memory_provider import MemoryProvider\n"
+            "class SlowMemory(MemoryProvider):\n"
+            "    @property\n"
+            "    def name(self): return 'slowmemory'\n"
+            "    def is_available(self): return True\n"
+            "    def initialize(self, **kw): pass\n"
+            "    def sync_turn(self, *a, **kw): pass\n"
+            "    def get_tool_schemas(self): return []\n"
+            "    def handle_tool_call(self, *a, **kw): return '{}'\n"
+            "def register(ctx): ctx.register_memory_provider(SlowMemory())\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(memory_plugins, "_get_user_plugins_dir", lambda: tmp_path)
+        module_name = memory_plugins._provider_module_name(provider_dir)
+        evict_module_tree(module_name)
+        start = threading.Event()
+        providers: list[MemoryProvider | None] = [None] * 32
+        errors: list[BaseException] = []
+
+        def load(index):
+            try:
+                start.wait()
+                providers[index] = memory_plugins.load_memory_provider("slowmemory")
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=load, args=(index,), daemon=True)
+            for index in range(32)
+        ]
+        for thread in threads:
+            thread.start()
+        start.set()
+        deadline = time.monotonic() + 5
+        for thread in threads:
+            thread.join(timeout=max(0, deadline - time.monotonic()))
+        alive = [thread for thread in threads if thread.is_alive()]
+        if not alive:
+            evict_module_tree(module_name)
+
+        assert alive == []
+        assert errors == []
+        assert all(provider is not None for provider in providers)
+        assert {
+            provider.name for provider in providers if provider is not None
+        } == {"slowmemory"}
+
+    def test_register_skills_finishes_before_load_returns(
+        self, tmp_path, monkeypatch
+    ):
+        """The per-load register callback completes before its caller returns."""
+        import plugins.memory as memory_plugins
+        from tests.plugins.loader_test_support import evict_module_tree
+
+        provider_dir = tmp_path / "skillmemory"
+        provider_dir.mkdir()
+        (provider_dir / "__init__.py").write_text(
+            "from agent.memory_provider import MemoryProvider\n"
+            "class SkillMemory(MemoryProvider):\n"
+            "    @property\n"
+            "    def name(self): return 'skillmemory'\n"
+            "    def is_available(self): return True\n"
+            "    def initialize(self, **kw): pass\n"
+            "    def sync_turn(self, *a, **kw): pass\n"
+            "    def get_tool_schemas(self): return []\n"
+            "    def handle_tool_call(self, *a, **kw): return '{}'\n"
+            "def register(ctx):\n"
+            "    ctx.register_memory_provider(SkillMemory())\n"
+            "    ctx.register_skill('ready-skill', 'SKILL.md')\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(memory_plugins, "_get_user_plugins_dir", lambda: tmp_path)
+        module_name = memory_plugins._provider_module_name(provider_dir)
+        evict_module_tree(module_name)
+        registered = []
+        monkeypatch.setattr(
+            memory_plugins._ProviderCollector,
+            "register_skill",
+            lambda self, *args, **kwargs: registered.append(args[0]),
+        )
+
+        try:
+            provider = memory_plugins.load_memory_provider(
+                "skillmemory", register_skills=True
+            )
+        finally:
+            evict_module_tree(module_name)
+
+        assert provider is not None
+        assert registered == ["ready-skill"]
+
+    def test_failed_provider_import_retains_helpers_and_denies_retry(
+        self, tmp_path, monkeypatch
+    ):
+        """Failure retains published helpers but denies same-process managed retries."""
+        import importlib
+        import sys
+        import plugins.memory as memory_plugins
+
+        provider_dir = tmp_path / "retrymemory"
+        provider_dir.mkdir()
+        init_file = provider_dir / "__init__.py"
+        valid_source = (
+            "from agent.memory_provider import MemoryProvider\n"
+            "from .helper import VALUE\n"
+            "class RetryMemory(MemoryProvider):\n"
+            "    @property\n"
+            "    def name(self): return VALUE\n"
+            "    def is_available(self): return True\n"
+            "    def initialize(self, **kw): pass\n"
+            "    def sync_turn(self, *a, **kw): pass\n"
+            "    def get_tool_schemas(self): return []\n"
+            "    def handle_tool_call(self, *a, **kw): return '{}'\n"
+            "def register(ctx): ctx.register_memory_provider(RetryMemory())\n"
+        )
+        init_file.write_text(
+            valid_source.replace(
+                "from .helper import VALUE\n",
+                "from .helper import VALUE\nraise RuntimeError('root failed')\n",
+            ),
+            encoding="utf-8",
+        )
+        helper_file = provider_dir / "helper.py"
+        helper_file.write_text("VALUE = 'stale'\n", encoding="utf-8")
+        monkeypatch.setattr(memory_plugins, "_get_user_plugins_dir", lambda: tmp_path)
+        module_name = memory_plugins._provider_module_name(provider_dir)
+
+        try:
+            first = memory_plugins.load_memory_provider("retrymemory")
+            cached_after_failure = sorted(
+                name
+                for name in sys.modules
+                if name == module_name or name.startswith(f"{module_name}.")
+            )
+            helper_file.write_text("VALUE = 'fresh-value'\n", encoding="utf-8")
+            init_file.write_text(valid_source, encoding="utf-8")
+            importlib.invalidate_caches()
+            second = memory_plugins.load_memory_provider("retrymemory")
+        finally:
+            for name in list(sys.modules):
+                if name == module_name or name.startswith(f"{module_name}."):
+                    sys.modules.pop(name, None)
+            if hasattr(memory_plugins, "retrymemory"):
+                delattr(memory_plugins, "retrymemory")
+
+        assert first is None
+        assert cached_after_failure == [f"{module_name}.helper"]
+        assert second is None
+
 
 class TestUserInstalledProviderDiscovery:
     """Memory providers installed to $HERMES_HOME/plugins/ should be found.
@@ -417,9 +578,9 @@ class TestUserInstalledProviderCli:
     """CLI commands of user-installed providers must be discoverable.
 
     Mirror of the relative-import regression above:
-    discover_plugin_cli_commands() imports the active provider's cli.py as
-    ``_hermes_user_memory.<name>.cli`` without registering the parent
-    packages, so a cli.py with a relative import could never load.
+    discover_plugin_cli_commands() imports the active provider's cli.py under
+    its path-scoped synthetic package. Without registering the parent packages,
+    a cli.py with a relative import could never load.
     """
 
     def _make_plugin_with_cli(self, tmp_path, name):
@@ -485,6 +646,170 @@ class TestUserInstalledProviderCli:
         p = load_memory_provider("extcliload")
         assert p is not None
         assert p.name == "extcliload"
+
+    def test_failed_cli_import_retains_namespace_and_denies_retry(
+        self, tmp_path, monkeypatch
+    ):
+        """CLI failure retains helpers without executing the provider root or retrying."""
+        import importlib
+        import sys
+        import types
+        from pathlib import Path
+
+        import plugins.memory as memory_plugins
+
+        plugin_dir = self._make_plugin_with_cli(tmp_path, "retrycli")
+        probe_name = "_hermes_cli_root_execution_probe"
+        probe = types.ModuleType(probe_name)
+        probe.root_executed = False
+        monkeypatch.setitem(sys.modules, probe_name, probe)
+        init_file = plugin_dir / "__init__.py"
+        init_file.write_text(
+            f"import {probe_name} as probe\nprobe.root_executed = True\n"
+            + init_file.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        helper_file = plugin_dir / "helper.py"
+        cli_file = plugin_dir / "cli.py"
+        helper_file.write_text("MARKER = 'stale'\n", encoding="utf-8")
+        cli_file.write_text(
+            "from .helper import MARKER\nraise RuntimeError('cli failed')\n",
+            encoding="utf-8",
+        )
+        self._activate(tmp_path, monkeypatch, "retrycli")
+
+        def loaded_from_plugin() -> list[str]:
+            plugin_path = plugin_dir.resolve()
+            loaded = []
+            for module_name, module in list(sys.modules.items()):
+                candidates = []
+                module_file = getattr(module, "__file__", None)
+                if module_file:
+                    candidates.append(module_file)
+                candidates.extend(getattr(module, "__path__", ()) or ())
+                for candidate in candidates:
+                    try:
+                        if Path(candidate).resolve().is_relative_to(plugin_path):
+                            loaded.append(module_name)
+                            break
+                    except (OSError, RuntimeError, TypeError):
+                        continue
+            return sorted(loaded)
+
+        first = memory_plugins.discover_plugin_cli_commands()
+        cached_after_failure = loaded_from_plugin()
+        helper_file.write_text("MARKER = 'fresh-value'\n", encoding="utf-8")
+        cli_file.write_text(
+            "from .helper import MARKER\n"
+            "def register_cli(subparser): subparser.marker = MARKER\n",
+            encoding="utf-8",
+        )
+        importlib.invalidate_caches()
+        second = memory_plugins.discover_plugin_cli_commands()
+        target = types.SimpleNamespace()
+        if second:
+            second[0]["setup_fn"](target)
+        for module_name in reversed(loaded_from_plugin()):
+            sys.modules.pop(module_name, None)
+
+        assert first == []
+        namespace = memory_plugins.path_scoped_module_name(
+            f"{memory_plugins._USER_NAMESPACE}_cli", "cli", cli_file
+        ).rsplit(".", 1)[0]
+        assert cached_after_failure == [namespace, f"{namespace}.helper"]
+        assert second == []
+        assert not hasattr(target, "marker")
+        assert probe.root_executed is False
+
+    def test_waiting_cli_discovery_refuses_failed_namespace(
+        self, tmp_path, monkeypatch
+    ):
+        """A waiting CLI discovery is refused after the first import fails."""
+        import importlib
+        from importlib import _bootstrap
+        import sys
+        import types
+
+        import plugins.memory as memory_plugins
+        from tests.plugins.loader_test_support import evict_module_tree
+
+        plugin_dir = self._make_plugin_with_cli(tmp_path, "concurrentcli")
+        helper_file = plugin_dir / "helper.py"
+        cli_file = plugin_dir / "cli.py"
+        probe_name = "_hermes_concurrent_cli_discovery_probe"
+        probe = types.ModuleType(probe_name)
+        probe.cli_started = threading.Event()
+        probe.release_failure = threading.Event()
+        monkeypatch.setitem(sys.modules, probe_name, probe)
+        helper_file.write_text("MARKER = 'stale'\n", encoding="utf-8")
+        cli_file.write_text(
+            "from .helper import MARKER\n"
+            f"import {probe_name} as probe\n"
+            "probe.cli_started.set()\n"
+            "if not probe.release_failure.wait(timeout=5):\n"
+            "    raise RuntimeError('failure release timed out')\n"
+            "raise RuntimeError('first CLI import failed')\n",
+            encoding="utf-8",
+        )
+        self._activate(tmp_path, monkeypatch, "concurrentcli")
+        module_name = memory_plugins.path_scoped_module_name(
+            f"{memory_plugins._USER_NAMESPACE}_cli",
+            "cli",
+            cli_file,
+        )
+        cleanup_root = module_name.rsplit(".", 1)[0]
+        results = {}
+        errors = []
+        waiter_observed = False
+
+        def discover(label):
+            try:
+                results[label] = memory_plugins.discover_plugin_cli_commands()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(f"{label}: {exc!r}")
+
+        first = threading.Thread(target=discover, args=("first",), daemon=True)
+        second = threading.Thread(target=discover, args=("second",), daemon=True)
+        evict_module_tree(cleanup_root)
+        try:
+            first.start()
+            assert probe.cli_started.wait(timeout=2), "first CLI import never started"
+            helper_file.write_text("MARKER = 'fresh-value'\n", encoding="utf-8")
+            cli_file.write_text(
+                "from .helper import MARKER\n"
+                "def register_cli(subparser): subparser.marker = MARKER\n",
+                encoding="utf-8",
+            )
+            importlib.invalidate_caches()
+            second.start()
+            module_lock = _bootstrap._get_module_lock(module_name)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if getattr(module_lock, "waiters", 0) >= 1:
+                    waiter_observed = True
+                    break
+                time.sleep(0.005)
+        finally:
+            probe.release_failure.set()
+            first.join(timeout=3)
+            second.join(timeout=3)
+
+        target = types.SimpleNamespace()
+        if results.get("second"):
+            results["second"][0]["setup_fn"](target)
+        helper_marker = getattr(
+            sys.modules.get(f"{cleanup_root}.helper"), "MARKER", None
+        )
+        evict_module_tree(cleanup_root)
+
+        assert waiter_observed, "second discovery did not wait on the CLI import lock"
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert errors == []
+        assert results["first"] == []
+        assert results["second"] == []
+        assert not hasattr(target, "marker")
+        assert helper_marker == "stale"
 
 
 class TestEntryPointMemoryProviderDiscovery:

@@ -218,6 +218,115 @@ def test_load_unknown_cron_scheduler_returns_none():
     assert load_cron_scheduler("does-not-exist-xyz") is None
 
 
+def test_concurrent_cron_provider_load_waits_for_module_execution(
+    tmp_path, monkeypatch
+):
+    """Concurrent callers must not reuse a partially executed cron module."""
+    import plugins.cron_providers as cron_plugins
+    from tests.plugins.loader_test_support import evict_module_tree
+
+    provider_dir = tmp_path / "slowcron"
+    provider_dir.mkdir()
+    (provider_dir / "__init__.py").write_text(
+        "import time\n"
+        "time.sleep(0.15)\n"
+        "from cron.scheduler_provider import CronScheduler\n"
+        "class SlowCron(CronScheduler):\n"
+        "    @property\n"
+        "    def name(self): return 'slowcron'\n"
+        "    def start(self, stop_event, **kwargs): pass\n"
+        "def register(ctx): ctx.register_cron_scheduler(SlowCron())\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cron_plugins, "_get_user_plugins_dir", lambda: tmp_path)
+    module_name = cron_plugins._provider_module_name(provider_dir)
+    evict_module_tree(module_name)
+    start = threading.Event()
+    providers: list[object | None] = [None] * 32
+    errors: list[BaseException] = []
+
+    def load(index):
+        try:
+            start.wait()
+            providers[index] = cron_plugins.load_cron_scheduler("slowcron")
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=load, args=(index,), daemon=True)
+        for index in range(32)
+    ]
+    for thread in threads:
+        thread.start()
+    start.set()
+    deadline = time.monotonic() + 5
+    for thread in threads:
+        thread.join(timeout=max(0, deadline - time.monotonic()))
+    alive = [thread for thread in threads if thread.is_alive()]
+    if not alive:
+        evict_module_tree(module_name)
+
+    assert alive == []
+    assert errors == []
+    assert all(provider is not None for provider in providers)
+    assert {getattr(provider, "name") for provider in providers} == {"slowcron"}
+
+
+def test_failed_cron_provider_import_retains_helpers_and_denies_retry(
+    tmp_path, monkeypatch
+):
+    """Failure retains published helpers but denies same-process managed retries."""
+    import importlib
+    import sys
+    import plugins.cron_providers as cron_plugins
+
+    provider_dir = tmp_path / "retrycron"
+    provider_dir.mkdir()
+    init_file = provider_dir / "__init__.py"
+    valid_source = (
+        "from cron.scheduler_provider import CronScheduler\n"
+        "from .helper import VALUE\n"
+        "class RetryCron(CronScheduler):\n"
+        "    @property\n"
+        "    def name(self): return VALUE\n"
+        "    def start(self, stop_event, **kwargs): pass\n"
+        "def register(ctx): ctx.register_cron_scheduler(RetryCron())\n"
+    )
+    init_file.write_text(
+        valid_source.replace(
+            "from .helper import VALUE\n",
+            "from .helper import VALUE\nraise RuntimeError('root failed')\n",
+        ),
+        encoding="utf-8",
+    )
+    helper_file = provider_dir / "helper.py"
+    helper_file.write_text("VALUE = 'stale'\n", encoding="utf-8")
+    monkeypatch.setattr(cron_plugins, "_get_user_plugins_dir", lambda: tmp_path)
+    module_name = cron_plugins._provider_module_name(provider_dir)
+
+    try:
+        first = cron_plugins.load_cron_scheduler("retrycron")
+        cached_after_failure = sorted(
+            name
+            for name in sys.modules
+            if name == module_name or name.startswith(f"{module_name}.")
+        )
+        helper_file.write_text("VALUE = 'fresh-value'\n", encoding="utf-8")
+        init_file.write_text(valid_source, encoding="utf-8")
+        importlib.invalidate_caches()
+        second = cron_plugins.load_cron_scheduler("retrycron")
+    finally:
+        for name in list(sys.modules):
+            if name == module_name or name.startswith(f"{module_name}."):
+                sys.modules.pop(name, None)
+        if hasattr(cron_plugins, "retrycron"):
+            delattr(cron_plugins, "retrycron")
+
+    assert first is None
+    assert cached_after_failure == [f"{module_name}.helper"]
+    assert second is None
+
+
 def test_cron_provider_package_does_not_shadow_core_cron_package(monkeypatch):
     """Putting plugins/ first on sys.path must not hide the core cron package."""
     from importlib.machinery import PathFinder

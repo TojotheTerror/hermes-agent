@@ -32,14 +32,18 @@ Usage:
 from __future__ import annotations
 
 import importlib
-import importlib.machinery
 import importlib.metadata
-import importlib.util
 import logging
-import sys
 from pathlib import Path
 from typing import List, Optional, Tuple, TYPE_CHECKING
 from hermes_cli.config import cfg_get
+from plugins._loader import (
+    ensure_namespace_package,
+    ensure_plugin_callbacks_allowed,
+    import_entry_point,
+    import_module_from_path,
+    path_scoped_module_name,
+)
 
 if TYPE_CHECKING:
     from agent.memory_provider import MemoryProvider
@@ -55,22 +59,24 @@ _REGISTERED_MEMORY_PROVIDER_SKILLS: dict[str, Path] = {}
 _USER_NAMESPACE = "_hermes_user_memory"
 
 
-def _register_synthetic_package(name: str, search_locations: List[str]) -> None:
-    """Register an empty package shell in sys.modules.
+def _is_bundled_provider(provider_dir: Path) -> bool:
+    """Return whether *provider_dir* is under the shipped provider root."""
+    try:
+        return provider_dir.parent.resolve() == _MEMORY_PLUGINS_DIR.resolve()
+    except (OSError, RuntimeError):
+        return provider_dir.parent == _MEMORY_PLUGINS_DIR
 
-    User-installed providers import as ``_hermes_user_memory.<name>``, a
-    dotted name whose parents exist nowhere on disk.  Unless those parents
-    are present in ``sys.modules``, any relative import inside the plugin
-    (``from . import config``) fails with
-    ``ModuleNotFoundError: No module named '_hermes_user_memory'`` — the
-    same reason the loader already registers ``plugins`` and
-    ``plugins.memory`` for bundled providers.
-    """
-    if name in sys.modules:
-        return
-    spec = importlib.machinery.ModuleSpec(name, None, is_package=True)
-    spec.submodule_search_locations = search_locations
-    sys.modules[name] = importlib.util.module_from_spec(spec)
+
+def _provider_module_name(provider_dir: Path) -> str:
+    """Return the bundled name or a path-scoped external package name."""
+    name = provider_dir.name
+    if _is_bundled_provider(provider_dir):
+        return f"plugins.memory.{name}"
+    return path_scoped_module_name(
+        _USER_NAMESPACE,
+        name,
+        provider_dir / "__init__.py",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +193,13 @@ def find_provider_dir(name: str) -> Optional[Path]:
     ``hermes <provider>`` subcommands — working, but a second-class citizen next
     to a directory install.
     """
+    return _find_directory_provider(name) or _entry_point_package_dir(
+        find_provider_entry_point(name)
+    )
+
+
+def _find_directory_provider(name: str) -> Optional[Path]:
+    """Select native directory installs without reinterpreting entry points."""
     # Bundled
     bundled = _MEMORY_PLUGINS_DIR / name
     if bundled.is_dir() and (bundled / "__init__.py").exists():
@@ -198,8 +211,7 @@ def find_provider_dir(name: str) -> Optional[Path]:
         candidate = source_dir / name
         if candidate.is_dir() and _is_memory_provider_dir(candidate):
             return candidate
-    # Pip entry point
-    return _entry_point_package_dir(find_provider_entry_point(name))
+    return None
 
 
 def _entry_point_package_dir(entry_point) -> Optional[Path]:
@@ -339,7 +351,9 @@ def load_memory_provider(
     if register_skills is None:
         register_skills = name == _get_active_memory_provider()
 
-    provider_dir = find_provider_dir(name)
+    # Package entry points retain their canonical cached-package failure domain.
+    # find_provider_dir's entry-point fallback is for CLI/config assets only.
+    provider_dir = _find_directory_provider(name)
     entry_point = None if provider_dir else find_provider_entry_point(name)
     if not provider_dir and entry_point is None:
         logger.debug(
@@ -374,7 +388,8 @@ def _load_provider_from_entry_point(
     """Import a provider entry point and extract the MemoryProvider instance."""
     from agent.memory_provider import MemoryProvider
 
-    loaded = entry_point.load()
+    loaded = import_entry_point(entry_point)
+    ensure_plugin_callbacks_allowed()
 
     if isinstance(loaded, MemoryProvider):
         return loaded
@@ -426,86 +441,28 @@ def _load_provider_from_dir(
     The module must have either:
     - A register(ctx) function (plugin-style) — we simulate a ctx
     - A top-level class that extends MemoryProvider — we instantiate it
+
+    Importlib caches module code. Provider extraction runs after import locks
+    are released and invokes ``register()`` on every load; the loader never
+    caches the mutable instance returned by a conforming plugin.
     """
     name = provider_dir.name
-    # Use a separate namespace for user-installed plugins so they don't
-    # collide with bundled providers in sys.modules.
-    _is_bundled = _MEMORY_PLUGINS_DIR in provider_dir.parents or provider_dir.parent == _MEMORY_PLUGINS_DIR
-    module_name = f"plugins.memory.{name}" if _is_bundled else f"{_USER_NAMESPACE}.{name}"
+    module_name = _provider_module_name(provider_dir)
     init_file = provider_dir / "__init__.py"
 
     if not init_file.exists():
         return None
 
-    # Check if already loaded.  A synthetic package shell registered by
-    # discover_plugin_cli_commands() for relative-import support has no
-    # __file__; only reuse modules that were actually loaded from disk.
-    cached = sys.modules.get(module_name)
-    if cached is not None and getattr(cached, "__file__", None):
-        mod = cached
-    else:
-        # Handle relative imports within the plugin
-        # First ensure the parent packages are registered
-        for parent in ("plugins", "plugins.memory"):
-            if parent not in sys.modules:
-                parent_path = Path(__file__).parent
-                if parent == "plugins":
-                    parent_path = parent_path.parent
-                parent_init = parent_path / "__init__.py"
-                if parent_init.exists():
-                    spec = importlib.util.spec_from_file_location(
-                        parent, str(parent_init),
-                        submodule_search_locations=[str(parent_path)]
-                    )
-                    if spec:
-                        parent_mod = importlib.util.module_from_spec(spec)
-                        sys.modules[parent] = parent_mod
-                        try:
-                            spec.loader.exec_module(parent_mod)
-                        except Exception:
-                            pass
+    try:
+        if not _is_bundled_provider(provider_dir):
+            namespace = module_name.rsplit(".", 1)[0]
+            ensure_namespace_package(namespace, provider_dir.parent)
+        mod = import_module_from_path(module_name, init_file)
+    except Exception as e:
+        logger.debug("Failed to import %s: %s", module_name, e)
+        return None
 
-        # User-installed plugins need their synthetic parent registered the
-        # same way, or relative imports inside the plugin cannot resolve.
-        if not _is_bundled:
-            _register_synthetic_package(_USER_NAMESPACE, [])
-
-        # Now load the provider module
-        spec = importlib.util.spec_from_file_location(
-            module_name, str(init_file),
-            submodule_search_locations=[str(provider_dir)]
-        )
-        if not spec:
-            return None
-
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = mod
-
-        # Register submodules so relative imports work
-        # e.g., "from .store import MemoryStore" in holographic plugin
-        for sub_file in provider_dir.glob("*.py"):
-            if sub_file.name == "__init__.py":
-                continue
-            sub_name = sub_file.stem
-            full_sub_name = f"{module_name}.{sub_name}"
-            if full_sub_name not in sys.modules:
-                sub_spec = importlib.util.spec_from_file_location(
-                    full_sub_name, str(sub_file)
-                )
-                if sub_spec:
-                    sub_mod = importlib.util.module_from_spec(sub_spec)
-                    sys.modules[full_sub_name] = sub_mod
-                    try:
-                        sub_spec.loader.exec_module(sub_mod)
-                    except Exception as e:
-                        logger.debug("Failed to load submodule %s: %s", full_sub_name, e)
-
-        try:
-            spec.loader.exec_module(mod)
-        except Exception as e:
-            logger.debug("Failed to exec_module %s: %s", module_name, e)
-            sys.modules.pop(module_name, None)
-            return None
+    ensure_plugin_callbacks_allowed()
 
     # Try register(ctx) pattern first (how our plugins are written)
     if hasattr(mod, "register"):
@@ -713,34 +670,21 @@ def discover_plugin_cli_commands() -> List[dict]:
     if not cli_file.exists():
         return results
 
-    _is_bundled = _MEMORY_PLUGINS_DIR in plugin_dir.parents or plugin_dir.parent == _MEMORY_PLUGINS_DIR
-    module_name = f"plugins.memory.{active_provider}.cli" if _is_bundled else f"{_USER_NAMESPACE}.{active_provider}.cli"
+    module_name = path_scoped_module_name(
+        f"{_USER_NAMESPACE}_cli",
+        "cli",
+        cli_file,
+    )
     try:
-        # Import the CLI module (lightweight — no SDK needed)
-        if module_name in sys.modules:
-            cli_mod = sys.modules[module_name]
-        else:
-            if not _is_bundled:
-                # cli.py imports as _hermes_user_memory.<name>.cli, usually
-                # before the provider itself is loaded.  Register its parent
-                # packages so relative imports inside cli.py
-                # ("from . import config") resolve without executing the
-                # plugin's __init__.py.  The package shell has no __file__,
-                # so _load_provider_from_dir() will still load the real
-                # module later instead of reusing the shell.
-                _register_synthetic_package(_USER_NAMESPACE, [])
-                _register_synthetic_package(
-                    f"{_USER_NAMESPACE}.{active_provider}", [str(plugin_dir)]
-                )
-            spec = importlib.util.spec_from_file_location(
-                module_name, str(cli_file)
-            )
-            if not spec or not spec.loader:
-                return results
-            cli_mod = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = cli_mod
-            spec.loader.exec_module(cli_mod)
+        # CLI files use an isolated code-less namespace so argparse discovery
+        # never executes the provider root merely to resolve relative imports.
+        cli_mod = import_module_from_path(
+            module_name,
+            cli_file,
+            package_dir=plugin_dir,
+        )
 
+        ensure_plugin_callbacks_allowed()
         register_cli = getattr(cli_mod, "register_cli", None)
         if not callable(register_cli):
             return results

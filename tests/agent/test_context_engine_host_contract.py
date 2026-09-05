@@ -33,6 +33,123 @@ from hermes_state import SessionDB
 from run_agent import AIAgent
 
 
+def test_concurrent_context_engine_load_waits_for_module_execution(
+    tmp_path, monkeypatch
+):
+    """Concurrent callers must not reuse a partially executed engine module."""
+    import threading
+    import time
+    import plugins.context_engine as context_plugins
+    from tests.plugins.loader_test_support import evict_module_tree
+
+    engine_dir = tmp_path / "slowcontext"
+    engine_dir.mkdir()
+    (engine_dir / "__init__.py").write_text(
+        "import time\n"
+        "time.sleep(0.15)\n"
+        "from agent.context_engine import ContextEngine\n"
+        "class SlowContext(ContextEngine):\n"
+        "    @property\n"
+        "    def name(self): return 'slowcontext'\n"
+        "    def should_compress(self, prompt_tokens=None): return False\n"
+        "    def compress(self, messages, **kwargs): return messages\n"
+        "    def update_from_response(self, usage): pass\n"
+        "def register(ctx): ctx.register_context_engine(SlowContext())\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(context_plugins, "_CONTEXT_ENGINE_PLUGINS_DIR", tmp_path)
+    monkeypatch.setattr(context_plugins, "__path__", [str(tmp_path)])
+    module_name = "plugins.context_engine.slowcontext"
+    evict_module_tree(module_name)
+    start = threading.Event()
+    engines: list[object | None] = [None] * 32
+    errors: list[BaseException] = []
+
+    def load(index):
+        try:
+            start.wait()
+            engines[index] = context_plugins.load_context_engine("slowcontext")
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=load, args=(index,), daemon=True)
+        for index in range(32)
+    ]
+    for thread in threads:
+        thread.start()
+    start.set()
+    deadline = time.monotonic() + 5
+    for thread in threads:
+        thread.join(timeout=max(0, deadline - time.monotonic()))
+    alive = [thread for thread in threads if thread.is_alive()]
+    if not alive:
+        evict_module_tree(module_name)
+
+    assert alive == []
+    assert errors == []
+    assert all(engine is not None for engine in engines)
+    assert {getattr(engine, "name") for engine in engines} == {"slowcontext"}
+
+
+def test_failed_context_engine_import_retains_helpers_and_denies_retry(
+    tmp_path, monkeypatch
+):
+    """Failure retains published helpers but denies same-process managed retries."""
+    import importlib
+    import sys
+    import plugins.context_engine as context_plugins
+
+    engine_dir = tmp_path / "retrycontext"
+    engine_dir.mkdir()
+    init_file = engine_dir / "__init__.py"
+    valid_source = (
+        "from agent.context_engine import ContextEngine\n"
+        "from .helper import VALUE\n"
+        "class RetryContext(ContextEngine):\n"
+        "    @property\n"
+        "    def name(self): return VALUE\n"
+        "    def should_compress(self, prompt_tokens=None): return False\n"
+        "    def compress(self, messages, **kwargs): return messages\n"
+        "    def update_from_response(self, usage): pass\n"
+        "def register(ctx): ctx.register_context_engine(RetryContext())\n"
+    )
+    init_file.write_text(
+        valid_source.replace(
+            "from .helper import VALUE\n",
+            "from .helper import VALUE\nraise RuntimeError('root failed')\n",
+        ),
+        encoding="utf-8",
+    )
+    helper_file = engine_dir / "helper.py"
+    helper_file.write_text("VALUE = 'stale'\n", encoding="utf-8")
+    monkeypatch.setattr(context_plugins, "_CONTEXT_ENGINE_PLUGINS_DIR", tmp_path)
+    monkeypatch.setattr(context_plugins, "__path__", [str(tmp_path)])
+    module_name = "plugins.context_engine.retrycontext"
+
+    try:
+        first = context_plugins.load_context_engine("retrycontext")
+        cached_after_failure = sorted(
+            name
+            for name in sys.modules
+            if name == module_name or name.startswith(f"{module_name}.")
+        )
+        helper_file.write_text("VALUE = 'fresh-value'\n", encoding="utf-8")
+        init_file.write_text(valid_source, encoding="utf-8")
+        importlib.invalidate_caches()
+        second = context_plugins.load_context_engine("retrycontext")
+    finally:
+        for name in list(sys.modules):
+            if name == module_name or name.startswith(f"{module_name}."):
+                sys.modules.pop(name, None)
+        if hasattr(context_plugins, "retrycontext"):
+            delattr(context_plugins, "retrycontext")
+
+    assert first is None
+    assert cached_after_failure == [f"{module_name}.helper"]
+    assert second is None
+
+
 def _bare_agent() -> AIAgent:
     agent = object.__new__(AIAgent)
     agent.session_id = "test-session"

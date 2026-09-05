@@ -28,12 +28,15 @@ Usage:
 from __future__ import annotations
 
 import importlib
-import importlib.machinery
-import importlib.util
 import logging
-import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
+from plugins._loader import (
+    ensure_namespace_package,
+    ensure_plugin_callbacks_allowed,
+    import_module_from_path,
+    path_scoped_module_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,22 +47,24 @@ _CRON_PLUGINS_DIR = Path(__file__).parent
 _USER_NAMESPACE = "_hermes_user_cron"
 
 
-def _register_synthetic_package(name: str, search_locations: List[str]) -> None:
-    """Register an empty package shell in sys.modules.
+def _is_bundled_provider(provider_dir: Path) -> bool:
+    """Return whether *provider_dir* is under the shipped provider root."""
+    try:
+        return provider_dir.parent.resolve() == _CRON_PLUGINS_DIR.resolve()
+    except (OSError, RuntimeError):
+        return provider_dir.parent == _CRON_PLUGINS_DIR
 
-    User-installed providers import as ``_hermes_user_cron.<name>``, a dotted
-    name whose parents exist nowhere on disk. Unless those parents are present
-    in ``sys.modules``, any relative import inside the plugin
-    (``from . import config``) fails with
-    ``ModuleNotFoundError: No module named '_hermes_user_cron'`` — the same
-    reason the loader already registers ``plugins`` and ``plugins.cron_providers`` for
-    bundled providers.
-    """
-    if name in sys.modules:
-        return
-    spec = importlib.machinery.ModuleSpec(name, None, is_package=True)
-    spec.submodule_search_locations = search_locations
-    sys.modules[name] = importlib.util.module_from_spec(spec)
+
+def _provider_module_name(provider_dir: Path) -> str:
+    """Return the bundled name or a path-scoped external package name."""
+    name = provider_dir.name
+    if _is_bundled_provider(provider_dir):
+        return f"plugins.cron_providers.{name}"
+    return path_scoped_module_name(
+        _USER_NAMESPACE,
+        name,
+        provider_dir / "__init__.py",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -220,94 +225,22 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["CronScheduler"]:  #
     - A top-level class that extends CronScheduler — we instantiate it
     """
     name = provider_dir.name
-    # Use a separate namespace for user-installed plugins so they don't
-    # collide with bundled providers in sys.modules.
-    _is_bundled = _CRON_PLUGINS_DIR in provider_dir.parents or provider_dir.parent == _CRON_PLUGINS_DIR
-    module_name = f"plugins.cron_providers.{name}" if _is_bundled else f"{_USER_NAMESPACE}.{name}"
+    module_name = _provider_module_name(provider_dir)
     init_file = provider_dir / "__init__.py"
 
     if not init_file.exists():
         return None
 
-    # Check if already loaded. A synthetic package shell has no __file__;
-    # only reuse modules that were actually loaded from disk.
-    cached = sys.modules.get(module_name)
-    if cached is not None and getattr(cached, "__file__", None):
-        mod = cached
-    else:
-        # Ensure the parent packages are registered (for relative imports)
-        for parent in ("plugins", "plugins.cron_providers"):
-            if parent not in sys.modules:
-                parent_path = Path(__file__).parent
-                if parent == "plugins":
-                    parent_path = parent_path.parent
-                parent_init = parent_path / "__init__.py"
-                if parent_init.exists():
-                    spec = importlib.util.spec_from_file_location(
-                        parent, str(parent_init),
-                        submodule_search_locations=[str(parent_path)]
-                    )
-                    if spec:
-                        parent_mod = importlib.util.module_from_spec(spec)
-                        sys.modules[parent] = parent_mod
-                        try:
-                            spec.loader.exec_module(parent_mod)
-                        except Exception:
-                            pass
+    try:
+        if not _is_bundled_provider(provider_dir):
+            namespace = module_name.rsplit(".", 1)[0]
+            ensure_namespace_package(namespace, provider_dir.parent)
+        mod = import_module_from_path(module_name, init_file)
+    except Exception as e:
+        logger.debug("Failed to import %s: %s", module_name, e)
+        return None
 
-        # User-installed plugins need their synthetic parent registered the
-        # same way, or relative imports inside the plugin cannot resolve.
-        if not _is_bundled:
-            _register_synthetic_package(_USER_NAMESPACE, [])
-
-        # Now load the provider module
-        spec = importlib.util.spec_from_file_location(
-            module_name, str(init_file),
-            submodule_search_locations=[str(provider_dir)]
-        )
-        if not spec:
-            return None
-
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = mod
-        loaded_submodules = []
-
-        # Register submodules so relative imports work
-        # e.g., "from ._nas_client import NasCronClient" in the chronos plugin
-        for sub_file in provider_dir.glob("*.py"):
-            if sub_file.name == "__init__.py":
-                continue
-            sub_name = sub_file.stem
-            full_sub_name = f"{module_name}.{sub_name}"
-            if full_sub_name not in sys.modules:
-                sub_spec = importlib.util.spec_from_file_location(
-                    full_sub_name, str(sub_file)
-                )
-                if sub_spec:
-                    sub_mod = importlib.util.module_from_spec(sub_spec)
-                    sys.modules[full_sub_name] = sub_mod
-                    try:
-                        sub_spec.loader.exec_module(sub_mod)
-                        loaded_submodules.append((sub_name, sub_mod))
-                    except Exception as e:
-                        logger.debug("Failed to load submodule %s: %s", full_sub_name, e)
-
-        try:
-            spec.loader.exec_module(mod)
-        except Exception as e:
-            logger.debug("Failed to exec_module %s: %s", module_name, e)
-            sys.modules.pop(module_name, None)
-            return None
-
-        # Manual importlib loading bypasses the normal import machinery that
-        # binds child modules onto their parent packages. Restore that shape so
-        # later dotted imports and pytest monkeypatch paths resolve normally.
-        parent_name, child_name = module_name.rsplit(".", 1)
-        parent_mod = sys.modules.get(parent_name)
-        if parent_mod is not None:
-            setattr(parent_mod, child_name, mod)
-        for sub_name, sub_mod in loaded_submodules:
-            setattr(mod, sub_name, sub_mod)
+    ensure_plugin_callbacks_allowed()
 
     # Try register(ctx) pattern first (how our plugins are written)
     if hasattr(mod, "register"):
