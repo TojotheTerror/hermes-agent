@@ -1779,6 +1779,9 @@ DEFAULT_CONFIG = {
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
     "kanban": {
+        # Trusted owner policy: exact board/task/PR/head/tree local-evidence exceptions.
+        # Empty by default; never represented as repository-required CI acceptance.
+        "pr_acceptance_exceptions": [],
         # Auto-subscribe the originating gateway/TUI session to completion + block events when
         # kanban_create is called from a session with a persistent delivery channel. Disable for
         # profiles that prefer explicit kanban_notify-subscribe calls per task.

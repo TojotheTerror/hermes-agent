@@ -56,15 +56,17 @@ After publishing, pass `metadata.published_pr` to completion. The first matching
 URL binds the card permanently; retries cannot substitute a green sibling PR.
 CLI `show --json` and `kanban_show` expose the persisted contract.
 
-The shared `complete_task` boundary covers worker tools, CLI, review approval and
+The default strict `complete_task` boundary covers worker tools, CLI, review approval and
 dashboard completion. It reads classic branch protection and active ruleset
 required contexts, paginates exact-head check runs and legacy statuses, then
 re-reads the PR head/base. Optional failed/skipped telemetry does not veto accepted
 required checks. Missing, pending, failed, cancelled, timed-out, stale, skipped or
 neutral **required** evidence cannot complete the card. Neither can zero-run
 acceptance, unreadable policy or GitHub API failures. A repository without required
-checks needs a local-only contract. `gh` must be authenticated with read access to
-the repository's checks and rules; no remote writes are performed by this gate.
+checks normally needs a local-only contract; an already-bound, merged release can
+instead use the narrowly scoped owner exception below. `gh` must be authenticated
+with read access to the repository's checks and rules; no remote writes are performed
+by this gate. Pagination works without `gh --slurp`, including older CLI versions.
 
 Rejection retains the active card and workspace. Durable `pr_acceptance` events
 store PR URL, SHA, required contexts, check IDs/URLs, classifications and recovery
@@ -81,6 +83,66 @@ transaction or a continuous post-completion monitor. This is a single-user lifec
 guard, not OS isolation against arbitrary direct database writes. GitHub Enterprise
 is not covered. Related publication/lifecycle work: #91230, #84254, #52311; local
 verification and publication alone are not remote acceptance.
+
+### Exact merged-release owner exceptions
+
+`kanban.pr_acceptance_exceptions` defaults to `[]`. It is trusted owner-controlled
+configuration in the active profile, not an agent metadata flag or a new tool.
+An entry must contain exactly these nonempty string fields:
+
+```yaml
+kanban:
+  pr_acceptance_exceptions:
+    - board: default
+      task_id: t_0123abcd
+      pr_url: https://github.com/OWNER/REPO/pull/123
+      head_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      tree_sha: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      approval_reason: Owner accepts verified local release evidence rather than required CI
+      approval_reference: owner-decision-reference
+      evidence_receipt: /absolute/path/to/release-receipt.json
+```
+
+Use `hermes config set kanban.pr_acceptance_exceptions '<JSON array>'` in the
+owning profile, after the owner has approved the exact release and reviewed the
+referenced evidence. The example SHAs/task above are placeholders, not authority.
+Preserve existing entries when adding/removing one. Invalid entries (including
+missing approval/evidence, wildcards, abbreviated SHAs, extra keys or duplicate
+board/task entries) do not authorize an exception. The runtime validates the value;
+`config set` storing it is not evidence that it is valid or has been consumed.
+Only canonical board database locations qualify; an arbitrary DB override does not
+inherit the active board's identity. Profile B cannot inherit profile A's policy.
+
+Normal completion still collects and persists the strict `pr_acceptance` receipt.
+If that fails and an exact exception matches the persisted PR contract, a separate
+read-only collector requires the live PR to be merged at the approved head, and
+requires both head and merge commit trees to equal the approved tree. It reads
+all paginated exact-head check runs and latest legacy statuses. Every present
+check/status must succeed (pending, failed, skipped, neutral, stale or unreadable
+evidence blocks this path); an empty check set is permitted only as local-evidence
+acceptance, never as green CI. The final PR identity is re-read after collection.
+
+The separate `pr_owner_exception` event records the scope, approval/evidence
+references, observed commit/tree/check identities, `classification: owner_exception`
+and `remote_required_ci_accepted: false`. The original strict failure is retained;
+403 does not mean no repository policy, and optional scans/local tests do not
+become required checks. The persisted completion contract is not rewritten.
+
+Run/status/contract ownership is rechecked under the existing completion transaction.
+The selected exception and active profile identity are also reloaded/rechecked there:
+removal, replacement or invalid configuration during collection rejects the attempt.
+This is a point-in-time filesystem-policy check, not an atomic transaction with a
+concurrent external config writer. The same-UID owner is trusted; this does not
+cryptographically authenticate approval or sandbox an agent that can edit config.
+Evidence references are audit pointers: the operator verifies their contents, not
+this collector. No new GitHub write, force-completion or automatic policy activation
+is introduced.
+
+For rollback, remove just the relevant exception with `hermes config set` (or set
+`[]` if it is the only entry). Future attempts use the strict gate again; completed
+tasks and historical receipts are not undone. After installing new tooling, use a
+fresh completion worker/process so already-imported modules are not mistaken for
+the newly installed code. No deployment/restart is implied by a config example.
 
 ## Kanban vs. `delegate_task`
 
