@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from typing import Any
 from urllib.parse import quote
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -22,14 +23,31 @@ def validate_contract(value: str | None) -> str:
     return value
 
 
-def _api(endpoint: str, *, query: str | None = None, paginate: bool = False):
+def _api(endpoint: str, *, query: str | None = None, paginate: bool = False) -> Any:
     command = ["gh", "api", endpoint, "--hostname", "github.com"]
     if query is not None:
         command += ["-f", "query=" + query]
     if paginate:
-        command += ["--paginate", "--slurp"]
+        command += ["--paginate"]
     result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
                             text=True, timeout=30, check=True)
+    if paginate:
+        # Older gh emits consecutive JSON documents. Decode every byte, keeping
+        # pages distinct (arrays for rules/statuses, objects for check runs).
+        pages, pos = [], 0
+        decoder = json.JSONDecoder()
+        text = result.stdout
+        while pos < len(text):
+            if text[pos] in " \t\r\n":
+                pos += 1
+                continue
+            page, pos = decoder.raw_decode(text, pos)
+            if not isinstance(page, (dict, list)) or (isinstance(page, dict) and page.get("errors")):
+                raise ValueError("Invalid GitHub pagination page")
+            pages.append(page)
+        if not pages:
+            raise ValueError("Missing GitHub pagination evidence")
+        return pages
     value = json.loads(result.stdout)
     if isinstance(value, dict) and value.get("errors"):
         raise ValueError("GitHub returned incomplete GraphQL evidence")
