@@ -271,6 +271,17 @@ def test_invalid_owner_policy_does_not_authorize(release, shape):
     values = {"missing": [{k: v for k, v in entry.items() if k != "approval_reference"}],
               "extra": [{**entry, "wildcard": True}], "duplicate": [entry, entry],
               "mapping": entry, "null": None}
-    configure(values[shape])
+    if shape in ("mapping", "null"):
+        # The writer rejects these shapes; exercise runtime rejection too, as
+        # malformed policy can still arrive through a hand-edited config.
+        with pytest.raises(SystemExit) as rejected:
+            configure(values[shape])
+        assert rejected.value.code == 1
+        import yaml
+        (home / "config.yaml").write_text(yaml.safe_dump({
+            "kanban": {"pr_acceptance_exceptions": values[shape]},
+        }))
+    else:
+        configure(values[shape])
     assert not kb.complete_task(conn, task)
     assert events(conn, task, "pr_owner_exception")[-1]["classification"] == "invalid_policy"
