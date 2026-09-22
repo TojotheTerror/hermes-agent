@@ -350,6 +350,19 @@ class TestBuildSkillsSystemPrompt:
         assert result.count("- search") == 1
 
 
+    def test_preamble_loads_covering_skills_not_keyword_matches(self, monkeypatch, tmp_path):
+        """'Even partially relevant, MUST load' made every loosely related skill mandatory and pulled
+        whole skill bodies into turns that did not need them. The preamble still routes a covering
+        skill through skill_view and keeps the tools-aware wording."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "skills" / "tools" / "search"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text("---\nname: search\ndescription: Search stuff\n---\n")
+        prompt = build_skills_system_prompt(available_tools={"skill_view", "terminal"})
+        assert "partially relevant" not in prompt and "MUST load" not in prompt
+        assert "skill_view(name)" in prompt and "- search: Search stuff" in prompt
+        assert "basic tools like terminal." in prompt  # no web tools -> no dangling web_search
+
     def test_compact_categories_demote_nested_and_miss_cache_separately(
         self, monkeypatch, tmp_path
     ):
