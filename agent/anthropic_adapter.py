@@ -541,6 +541,10 @@ _OAUTH_SYSTEM_REPLACEMENTS = (
 # dereferences, and the rewritten form does not exist (#48860). The OPENING quote marks an
 # identifier; a sentence-final ``.`` or a possessive ``'s`` is prose.
 _OAUTH_SLUG_PATTERN = re.compile(r"""(?<![\w./:@'"`-])hermes-agent(?![\w/@-]|\.\w)""")
+# Skill-index entry names are identifiers too: the model passes them to skill_view(), so a
+# rewritten entry lists a second ``claude-code`` skill and hides the real one. Capturing split
+# keeps the block as every odd chunk.
+_OAUTH_SKILL_INDEX_BLOCK = re.compile(r"(<available_skills>.*?</available_skills>)", re.S)
 
 
 def _apply_claude_code_identity(system, anthropic_tools, anthropic_messages, to_wire):
@@ -557,7 +561,8 @@ def _apply_claude_code_identity(system, anthropic_tools, anthropic_messages, to_
             text = block.get("text", "")
             for old, new in _OAUTH_SYSTEM_REPLACEMENTS:
                 text = text.replace(old, new)
-            text = _OAUTH_SLUG_PATTERN.sub("claude-code", text)
+            text = "".join(chunk if i % 2 else _OAUTH_SLUG_PATTERN.sub("claude-code", chunk)
+                           for i, chunk in enumerate(_OAUTH_SKILL_INDEX_BLOCK.split(text)))
             block["text"] = _apply_oauth_prose_aliases(text)
     for tool in anthropic_tools or []:
         if "name" in tool:

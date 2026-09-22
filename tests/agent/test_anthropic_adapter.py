@@ -1935,6 +1935,30 @@ def test_oauth_system_prompt_sanitizer_preserves_docs_url():
     assert kwargs["system"][-1]["text"].count("claude-code") == 3  # the caller's block, not the CC prefix
 
 
+def test_oauth_system_prompt_sanitizer_keeps_skill_index_names():
+    """An index entry name is what the model passes to skill_view(); rewriting it listed a second
+    claude-code skill and hid hermes-agent. Prose outside the index is still rewritten."""
+    kwargs = build_anthropic_kwargs(
+        model="claude-sonnet-4-20250514",
+        messages=[
+            {"role": "system", "content": (
+                "Load hermes-agent skills.\n<available_skills>\n  autonomous-ai-agents:\n"
+                "    - claude-code: Delegate coding to Claude Code CLI.\n"
+                "    - hermes-agent: Use and orchestrate Hermes Agent.\n</available_skills>\n"
+                "Ask hermes-agent docs.")},
+            {"role": "user", "content": "Hi"},
+        ],
+        tools=None,
+        max_tokens=4096,
+        reasoning_config=None,
+        is_oauth=True,
+    )
+
+    text = kwargs["system"][-1]["text"]
+    assert "    - hermes-agent: Use and orchestrate Claude Code.\n" in text
+    assert "Load claude-code skills." in text and "Ask claude-code docs." in text
+
+
 def test_unsupported_inline_image_subtype_downgrades_to_text_for_anthropic(monkeypatch):
     """Sibling of the Responses guard: a data:image/svg+xml (or bmp/tiff) part forwarded verbatim as
     ``media_type`` 400s the Anthropic request on every replay — it must become a text placeholder
