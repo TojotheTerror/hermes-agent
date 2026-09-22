@@ -7422,6 +7422,14 @@ class TestSupportsReasoningExtraBody:
 class TestMemoryContextSanitization:
     """sanitize_context() helper correctness — used at provider boundaries."""
 
+    def test_recall_note_is_background_not_authority(self):
+        """Recall can be stale or come from out-of-scope sources, so the wrapper must not tell the
+        model to let it inform every response. The note must still strip on its own."""
+        from agent.memory_manager import build_memory_context_block, sanitize_context
+        note = build_memory_context_block("- fact\n").split("\n", 2)[1]
+        assert "authoritative" not in note and "background" in note
+        assert sanitize_context(note + "\n\nkept") == "kept"
+
 
     def test_sanitize_context_strips_full_block(self):
         """Helper-level: a string with an embedded memory-context block is
