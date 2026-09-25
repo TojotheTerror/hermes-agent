@@ -246,7 +246,7 @@ def _(rid, params: dict) -> dict:
 # One-expression handlers: name → (fail_code, payload builder(params)).
 _SIMPLE_RPCS = {
     # Session-scoped view of the background process registry (desktop status stack).
-    "process.stop": (5010, lambda params: {"killed": _tools_mod("tools.process_registry").process_registry.kill_all()}),
+    "process.stop": (5010, lambda params: {"killed": _tools_mod("tools.process_registry").process_registry.kill_all(source="process.stop")}),
     # Re-read ``~/.hermes/.env`` (CLI ``/reload`` parity); built agents keep their pool, ``/new`` resolves fresh.
     "reload.env": (5015, lambda params: {"updated": int(_tools_mod("hermes_cli.config").reload_env())}),
     "plugins.list": (5032, lambda params: {"plugins": [
@@ -289,6 +289,46 @@ def _mcp_reload_confirm_required() -> bool:
         return True
 
 
+def _refresh_live_sessions(home=None, *, preserve_prefix: bool = False, note: str = "") -> None:
+    """Rebuild live sessions' cached tool snapshots from the registry and push session.info (agents
+    never re-read the registry). The MCP pool is process-global, so refreshing only the requester
+    would leave sibling sessions on stale tools until /new — and a request without a resolvable
+    session_id (desktop passes ``activeSessionId ?? undefined``) would refresh nothing while still
+    answering "reloaded". ``enabled_override`` re-resolves toolsets so a server enabled this session
+    (config or a just-installed plugin) is in the session's ``tool_call`` scope.
+
+    ``home``: only sessions of that profile home (a session with no ``profile_home`` belongs to the
+    launch home). ``preserve_prefix``: append-only rebuild inside a live conversation. ``note``: queued
+    for each session's next turn on the one-shot turn-note channel (``agent/turn_context.py``)."""
+    from hermes_constants import hermes_home_key
+    want = hermes_home_key(home) if home is not None else None
+    with _sessions_lock:
+        live = [(sid, sess) for sid, sess in _sessions.items() if sess.get("agent") is not None and (
+            want is None or hermes_home_key(sess.get("profile_home") or get_process_hermes_home()) == want)]
+    refresh = _tools_mod("tools.mcp_tool_agent").refresh_agent_mcp_tools
+    for sid, sess in live:
+        agent = sess["agent"]
+        try:
+            with _session_profile_runtime_scope(sess):
+                enabled = _load_enabled_toolsets(getattr(agent, "platform", None))
+                disabled = _load_disabled_toolsets()
+                refresh(agent, enabled_override=enabled, disabled_override=disabled,
+                        quiet_mode=True, preserve_prefix=preserve_prefix)
+        except Exception as _exc:
+            logger.warning("Failed to refresh cached agent tools (session %s): %s", sid, _exc)
+        if note:
+            prior = getattr(agent, "_gateway_turn_context_notes", "") or ""
+            agent._gateway_turn_context_notes = f"{prior}\n\n{note}" if prior else note
+        _emit("session.info", sid, _session_info(agent, sess))
+
+
+def refresh_plugin_sessions(home, note: str) -> None:
+    """A plugin just went live in ``home``: append its MCP tools to that profile's open chats (deferred
+    behind tool_search, so the model-facing tool array is unchanged) and queue ``note`` for their next
+    turn. Called by ``hermes_cli.plugins_activation_live``."""
+    _refresh_live_sessions(home, preserve_prefix=True, note=note)
+
+
 @_rpc("reload.mcp", 5015)
 def _(rid, params: dict) -> dict:
     session = _sessions.get(params.get("session_id", ""))
@@ -315,22 +355,8 @@ def _(rid, params: dict) -> dict:
     req_rev = str(params.get("rev") or "")
 
     def _refresh_session_agent() -> None:
-        """Rebuild EVERY live session's cached tool snapshot + push session.info (agents never
-        re-read the registry). The MCP pool is process-global, so refreshing only the requester
-        would leave sibling sessions on stale tools until /new — and a request without a
-        resolvable session_id (desktop passes ``activeSessionId ?? undefined``) would refresh
-        nothing while still answering "reloaded". Runs under _mcp_reload_lock so a concurrent
-        reload can't tear the registry down mid-refresh."""
-        with _sessions_lock:
-            live = [(sid, sess) for sid, sess in _sessions.items() if sess.get("agent") is not None]
-        for sid, sess in live:
-            agent = sess["agent"]
-            try:  # enabled_override re-resolves toolsets so a server enabled in config this session is picked up
-                with _session_profile_runtime_scope(sess):
-                    _mcp_agent.refresh_agent_mcp_tools(agent, enabled_override=_load_enabled_toolsets(), quiet_mode=True)
-            except Exception as _exc:
-                logger.warning("Failed to refresh cached agent tools after /reload-mcp (session %s): %s", sid, _exc)
-            _emit("session.info", sid, _session_info(agent, sess))
+        """Runs under _mcp_reload_lock so a concurrent reload can't tear the registry down mid-refresh."""
+        _refresh_live_sessions()
 
     def _do_full_reload() -> None:
         """shutdown+discover+refresh under the lock, then mark a completed generation. Config
@@ -501,14 +527,15 @@ def _(rid, params: dict) -> dict:
     hint = _cli_exec_blocked(argv)
     if hint:
         return _ok(rid, {"blocked": True, "hint": hint, "code": -1, "output": ""})
-
-    # Can drive the agent → needs provider credentials; tier-1 secrets still stripped.
+    # Same-interpreter re-exec: ambient PYTHONPATH must survive the env factory's
+    # Hermes-owned strip (no-boot-through-venv).
+    _compat = _tools_mod("hermes_cli._subprocess_compat")
     return _captured_exec(
         rid, [sys.executable, "-m", "hermes_cli.main", *argv], min(int(params.get("timeout", 240)), 600),
         on_result=lambda r: _ok(rid, {
             "blocked": False, "code": r.returncode, "output": (_joined_output(r) or "(no output)")[:48_000]}),
         timeout_err=(5016, "cli.exec: timeout"), fail_code=5017,
-        env=hermes_subprocess_env(inherit_credentials=True))
+        env=_compat.restore_ambient_pythonpath(hermes_subprocess_env(inherit_credentials=True)))
 
 
 @_rpc("command.resolve", 5012)
@@ -753,13 +780,17 @@ def _cmd_retry(rid, params, session, name, arg):
 def _cmd_steer(rid, params, session, name, arg):
     if not arg:
         return _err(rid, 4004, "usage: /steer <prompt>")
-    agent = session.get("agent") if session else None
+    shown = f"{arg[:80]}{'...' if len(arg) > 80 else ''}"
+    # An idle agent still accepts steer(), but nothing drains it until the NEXT turn's pre-API
+    # drain, which splices it after whatever tool row is newest (#64578). Idle → a normal message.
+    if not (session and session.get("running")):
+        return _ok(rid, {"type": "send", "message": arg, "notice": f"No agent running; sent as next turn: {shown}"})
+    agent = session.get("agent")
     if agent and hasattr(agent, "steer"):
         with contextlib.suppress(Exception):
             if agent.steer(arg):
-                shown = f"{arg[:80]}{'...' if len(arg) > 80 else ''}"
                 return _exec_out(rid, f"⏩ Steer queued — arrives after the next tool call: {shown}")
-    return _ok(rid, {"type": "send", "message": arg})  # no active run: next-turn message
+    return _ok(rid, {"type": "send", "message": arg})  # turn still building / steer refused: next-turn message
 
 
 def _cmd_goal(rid, params, session, name, arg):
@@ -950,7 +981,8 @@ def _(rid, params: dict) -> dict:
                 try:
                     worker = _SlashWorker(
                         session["session_key"], getattr(session.get("agent"), "model", _resolve_model()),
-                        profile_home=session.get("profile_home"))
+                        profile_home=session.get("profile_home"),
+                        provider=getattr(session.get("agent"), "provider", None) or None)
                     _attach_worker(sid, session, worker)
                 except Exception as e:
                     return _err(rid, 5030, f"slash worker start failed: {e}")
@@ -1093,8 +1125,10 @@ def _(rid, params: dict) -> dict:
     mt = _tools_mod("model_tools")
     session = _sessions.get(params.get("session_id", ""))
     enabled = getattr(session["agent"], "enabled_toolsets", None) if session else _load_enabled_toolsets()
+    disabled = getattr(session["agent"], "disabled_toolsets", None) if session else _load_disabled_toolsets()
     # Pre-assembly list: /tools must also show tools deferred behind the tool_search bridge (as the CLI).
-    tools = mt.get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True, skip_tool_search_assembly=True)
+    tools = mt.get_tool_definitions(enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=True,
+                                    skip_tool_search_assembly=True)
     sections = {}
     for tool in sorted(tools, key=lambda t: t["function"]["name"]):
         name = tool["function"]["name"]
@@ -1334,10 +1368,23 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4090, f"server '{name}' already exists")
     raw_cfg = params.get("config")
     server_config: dict = dict(raw_cfg) if isinstance(raw_cfg, dict) else {}
-    if preset:  # fills url/command/args when omitted; mutates server_config in place
-        mc._apply_mcp_preset(
-            name, preset_name=preset, url=server_config.get("url"), command=server_config.get("command"),
-            cmd_args=list(server_config.get("args") or []), server_config=server_config)
+    # Explicit url/command wins. Otherwise a desktop catalog id is resolved
+    # before the CLI preset registry — that registry raises, and the wrapper
+    # turns the raise into 5024 before the 4063 check below can run.
+    if preset and not (server_config.get("url") or server_config.get("command")):
+        catalog = _tools_mod("hermes_cli.mcp_catalog")
+        entry = catalog.get_entry(preset)
+        if entry is not None:
+            for key, value in catalog._build_server_config(entry, install_dir=None).items():
+                server_config.setdefault(key, value)
+        else:
+            try:
+                mc._apply_mcp_preset(
+                    name, preset_name=preset, url=server_config.get("url"),
+                    command=server_config.get("command"),
+                    cmd_args=list(server_config.get("args") or []), server_config=server_config)
+            except ValueError:
+                return _err(rid, 4063, f"Unknown MCP catalog entry or preset: {preset}")
     if not server_config.get("url") and not server_config.get("command"):
         return _err(rid, 4063, "config must specify a 'url' (http) or 'command' (stdio), or a valid 'preset'")
     if bearer_token := params.get("bearer_token"):
@@ -1558,7 +1605,10 @@ def _ensure_plugin_activation_listener() -> None:
 
 
 def _with_activation(result: dict, name: str) -> dict:
-    """Prefer the summary this process's listener captured over the core's own copy."""
+    """Fill ``activation`` from this process's listener when the core returned none (the core's own
+    copy carries ``live_now``, which the listener's load-time summary cannot)."""
+    if result.get("activation"):
+        return result
     for key in (name, result.get("plugin_name"), result.get("name")):
         if key and key in _plugin_activations:
             result["activation"] = _plugin_activations[key]
@@ -1618,7 +1668,7 @@ def _plugins_update(rid, params):
         return _err(rid, 4019, "plugins.update requires a 'name'")
     pc, cat = _tools_mod("hermes_cli.plugins_cmd"), _tools_mod("hermes_cli.plugins_cmd_catalog")
     target = pc._plugins_dir() / name
-    sidecar = cat.read_catalog_sidecar(target) if target.is_dir() else None
+    sidecar = cat.catalog_install_record(target) if target.is_dir() else None
     if not sidecar:
         return _err(rid, 4020, f"'{name}' is not a catalog install — update it via the CLI")
     try:
@@ -1669,7 +1719,12 @@ def _plugins_settings(rid, params):
     return _ok(rid, {"ok": True, "name": canonical, "written": written, "plugin": row})
 
 
-_PLUGINS_ACTIONS = {"list": _plugins_list, "toggle": _plugins_toggle, "install": _plugins_install,
+def _plugins_onboarding(rid, params):
+    """Catalog plugins curated for the onboarding card that this OS runs, each with its app state."""
+    return _ok(rid, {"onboarding": _tools_mod("hermes_cli.plugin_catalog_presence").onboarding_entries()})
+
+
+_PLUGINS_ACTIONS = {"list": _plugins_list, "onboarding": _plugins_onboarding, "toggle": _plugins_toggle, "install": _plugins_install,
                     "update": _plugins_update, "remove": _plugins_remove, "settings": _plugins_settings}
 
 

@@ -17,12 +17,11 @@ import {
   $layoutTree,
   bindPaneVisibility,
   bindToolPaneCollapse,
-  bindTreeSideVisibility,
   declareDefaultTree,
   dismissTreePane,
+  hydrateContributedPanes,
   isPaneVisible,
   markCollapsePane,
-  mirrorLayoutTree,
   paneRootSide,
   registerLayoutResetHandler,
   registerPaneCloser,
@@ -33,8 +32,7 @@ import {
   setStripTabHidden,
   targetZoneTabStripVisible,
   togglePaneVisible,
-  toggleTargetZoneTabStrip,
-  watchContributedPanes
+  toggleTargetZoneTabStrip
 } from '@/components/pane-shell/tree/store'
 import { $workspaceOwnerLabels, workspaceOwnerTitle } from '@/components/pane-shell/workspace-scope'
 import { SidebarProvider } from '@/components/ui/sidebar'
@@ -51,7 +49,6 @@ import {
   PanelBottom,
   PanelTop,
   SlidersHorizontal,
-  Terminal,
   Upload,
   Users,
   Zap
@@ -60,10 +57,10 @@ import { type KeybindContribution, KEYBINDS_AREA } from '@/lib/keybinds/actions'
 import { isOnboardingEnabled } from '@/lib/onboarding-enabled'
 import { TRANSCRIPT_DIRECTIVE_AREA, type TranscriptDirectiveContribution } from '@/lib/transcript-directives'
 import { setYoloEnabled } from '@/lib/yolo-session'
+import { $connectionsRegistry } from '@/store/connection-registry-state'
 import { $interfaceMode, $showsAdvancedChrome, setModeContext, toggleSimpleMode } from '@/store/interface-mode'
 import {
   $fileBrowserOpen,
-  $panesFlipped,
   $sidebarOpen,
   FILE_BROWSER_DEFAULT_WIDTH,
   FILE_BROWSER_MAX_WIDTH,
@@ -101,6 +98,7 @@ import { startSessionDrag } from '../chat/session-drag'
 import {
   SessionTileCloseConfirm,
   stackSessionTilesIntoMain,
+  startTileBackendIdentityGuard,
   startUnrestoredTileTitleBackfill,
   watchSessionTiles,
   WorkspaceTabMenu
@@ -108,9 +106,11 @@ import {
 import { AppContextMenu } from '../context-menu/app-context-menu'
 import { HudShell } from '../hud/hud-shell'
 import { $terminalTakeover, setTerminalTakeover } from '../right-sidebar/store'
+import { terminalPaletteToggle } from '../right-sidebar/terminal/reveal-focus'
 import { $workspaceIsPage, WORKSPACE_PAGE_HEADER_AREA } from '../routes'
 
-import { DEFAULT_TREE, registerLayoutPresets } from './layout-presets'
+import { BASIC_TREE, DEFAULT_TREE, registerLayoutPresets } from './layout-presets'
+import { bindLayoutSides } from './layout-sides'
 import { FilesPane, LogsPane, ReviewPaneContent } from './panes'
 import { ContribWiring, WiredPane } from './wiring'
 
@@ -448,7 +448,7 @@ registry.registerMany([
 
 registerLayoutPresets()
 
-declareDefaultTree(DEFAULT_TREE)
+declareDefaultTree(DEFAULT_TREE, BASIC_TREE)
 
 // Bundled plugins load AFTER core, so a same-id contribution from a plugin
 // deliberately overrides the core default (last writer wins). Third-party
@@ -456,8 +456,10 @@ declareDefaultTree(DEFAULT_TREE)
 discoverBundledPlugins()
 
 // Plugin panes join the tree by their `placement` hint the moment they
-// register — incl. runtime plugins arriving seconds after boot.
-watchContributedPanes()
+// register — incl. runtime plugins arriving seconds after boot. The FIRST
+// pass runs as layout hydration: the reload prune→re-register cycle must not
+// record split shares (#108679).
+hydrateContributedPanes()
 
 // Session + route (page) tiles: persisted splits register panes docked beside
 // main. A popped-out Browser and the HUD have no layout tree — registering
@@ -467,6 +469,7 @@ watchContributedPanes()
 if (!isBrowserWindow() && !isHudWindow()) {
   watchSessionTiles()
   startUnrestoredTileTitleBackfill()
+  startTileBackendIdentityGuard()
   watchRouteTiles()
   watchPreviewTiles()
 }
@@ -552,57 +555,7 @@ registerLayoutResetHandler(stackSessionTilesIntoMain)
 // bindToolPaneCollapse — so the boot rule it encodes is testable against the
 // real function instead of a copy. See its docblock for the semantics.
 
-// SIDES have one source of truth: the TREE. The legacy $panesFlipped flag is
-// DERIVED from where the sessions zone actually sits (TitlebarControls maps
-// its left/right buttons through it), so dragging sessions across — or
-// applying a mirrored preset — remaps the buttons automatically. The flip
-// action (⌘\ / titlebar) mirrors the tree only when they disagree.
-const sessionsOnRight = () => {
-  const tree = $layoutTree.get()
-
-  if (!tree) {
-    return null
-  }
-
-  const order = allPaneIds(tree)
-  const sessions = order.indexOf('sessions')
-  const main = order.indexOf('workspace')
-
-  return sessions >= 0 && main >= 0 ? sessions > main : null
-}
-
-$layoutTree.subscribe(() => {
-  const flipped = sessionsOnRight()
-
-  if (flipped !== null && flipped !== $panesFlipped.get()) {
-    $panesFlipped.set(flipped)
-  }
-})
-
-$panesFlipped.listen(flipped => {
-  const current = sessionsOnRight()
-
-  if (current !== null && current !== flipped) {
-    mirrorLayoutTree()
-  }
-})
-
-// Side toggles (titlebar buttons, ⌘B / ⌘J) collapse a whole edge of the main
-// zone — everything on it hides together, whatever has been rearranged there.
-// Which store owns which edge follows the panes: mirrored, the sidebar sits
-// on the right and $sidebarOpen goes with it (see sidebarSide in store/layout).
-const $leftEdgeOpen = computed([$panesFlipped, $sidebarOpen, $fileBrowserOpen], (flipped, sidebar, files) =>
-  flipped ? files : sidebar
-)
-
-const $rightEdgeOpen = computed([$panesFlipped, $sidebarOpen, $fileBrowserOpen], (flipped, sidebar, files) =>
-  flipped ? sidebar : files
-)
-
-bindTreeSideVisibility('left', $leftEdgeOpen, open => ($panesFlipped.get() ? setFileBrowserOpen : setSidebarOpen)(open))
-bindTreeSideVisibility('right', $rightEdgeOpen, open =>
-  ($panesFlipped.get() ? setSidebarOpen : setFileBrowserOpen)(open)
-)
+bindLayoutSides()
 
 // Workspace-scoped surfaces: the file tree and git diff only mean something
 // inside a project. A detached chat (no cwd) hides them — their zones
@@ -645,25 +598,11 @@ bindToolPaneCollapse(
   () => setTerminalTakeover(true),
   $showsAdvancedChrome
 )
-// Policies may consult the install: the profile rail stays in Simple when a
-// second profile makes it the only remaining way to switch.
+// Without the statusbar, the rail is the only way to switch profiles or gateways.
 $profiles.subscribe(profiles => setModeContext({ profileCount: profiles.length }))
-// ⌘K door onto the same pane the keybind and statusbar pill flip — was a
-// one-way "open" row under Go to, so it never showed on/off and couldn't hide.
-// Reads the TREE like every other pane toggle: `$terminalTakeover` stays true
-// behind a stacked sibling tab or a minimized zone, which would light the row
-// "on" for a terminal that isn't on screen.
-registry.register(
-  paletteToggle({
-    id: 'view.showTerminal',
-    label: 'Toggle terminal',
-    action: 'view.showTerminal',
-    icon: Terminal,
-    keywords: ['terminal', 'shell', 'console', 'pty'],
-    get: () => isPaneVisible('terminal'),
-    set: () => togglePaneVisible('terminal')
-  })
-)
+$connectionsRegistry.subscribe(registry => setModeContext({ connectionCount: registry?.connections.length ?? 0 }))
+// ⌘K door onto the same pane the keybind and statusbar pill flip.
+registry.register(terminalPaletteToggle)
 
 // Logs are ⌘K-ONLY chrome: the pane contribution EXISTS only while $logsOpen
 // is on. Off (the default) keeps logs out of the registry and the tree
