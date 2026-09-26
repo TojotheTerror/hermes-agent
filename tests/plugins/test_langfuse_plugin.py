@@ -932,6 +932,44 @@ class TestModelAttribution:
         )
         assert seen["model"] == "actual/served-model"
 
+    @pytest.mark.parametrize("first_chunk_at, expect_set", [(1_790_000_000.25, True), (None, False)])
+    def test_post_api_request_first_chunk_sets_completion_start_time(self, monkeypatch, first_chunk_at, expect_set):
+        """Langfuse derives time to first token from completion_start_time;
+        it must equal the hook's first-chunk instant, and stay unset when the call did not stream."""
+        from datetime import datetime, timezone
+
+        mod = self._fresh_plugin()
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: object())
+        mod._TRACE_STATE.clear()
+
+        updates: list = []
+
+        class _Gen:
+            def update(self, **kw): updates.append(kw)
+            def end(self, **kw): pass
+
+        class _Root:
+            def update(self, **kw): pass
+            def end(self, **kw): pass
+            def set_trace_io(self, **kw): pass
+
+        turn_id = "s:t:turn4"
+        key = mod._trace_key("t", "s", turn_id=turn_id)
+        state = mod.TraceState(trace_id="x", root_ctx=None, root_span=_Root())
+        state.generations["1"] = _Gen()
+        mod._TRACE_STATE[key] = state
+
+        mod.on_post_llm_call(
+            task_id="t", session_id="s", turn_id=turn_id, api_call_count=1,
+            model="m", usage={"input_tokens": 1, "output_tokens": 1},
+            assistant_tool_call_count=1, first_chunk_at=first_chunk_at,
+        )
+        merged = {k: v for kw in updates for k, v in kw.items()}
+        if expect_set:
+            assert merged["completion_start_time"] == datetime.fromtimestamp(first_chunk_at, tz=timezone.utc)
+        else:
+            assert "completion_start_time" not in merged
+
 
 # ---------------------------------------------------------------------------
 # Cost total: explicit "total" alongside the per-type breakdown

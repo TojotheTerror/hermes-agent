@@ -17,6 +17,7 @@ import os
 import re
 import threading
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -607,6 +608,13 @@ def _start_child_observation(state: TraceState, *, name: str, as_type: str, inpu
                                              model=model, model_parameters=model_parameters)
 
 
+def _completion_start_time(first_chunk_at: Any) -> Optional[datetime]:
+    """First streamed chunk (epoch seconds) as Langfuse's completion_start_time, which drives time to first token."""
+    if isinstance(first_chunk_at, bool) or not isinstance(first_chunk_at, (int, float)) or first_chunk_at <= 0:
+        return None
+    return datetime.fromtimestamp(first_chunk_at, tz=timezone.utc)
+
+
 def _end_observation(observation: Any, *, output: Any = None, metadata: Optional[dict] = None,
                      usage_details: Optional[dict] = None, cost_details: Optional[dict] = None) -> None:
     if observation is None:
@@ -828,7 +836,8 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
                      response: Any = None, api_duration: float = 0.0, finish_reason: str = "", usage: Any = None,
                      assistant_content_chars: int = 0, assistant_tool_call_count: int = 0,
                      assistant_response: Any = None, turn_id: str = "", api_request_id: str = "",
-                     response_model: Any = None, moa_references: Any = None, **_: Any) -> None:
+                     response_model: Any = None, moa_references: Any = None, first_chunk_at: Any = None,
+                     **_: Any) -> None:
     client, task_key = _client_and_key(task_id, session_id, turn_id, api_request_id)
     if client is None:
         return
@@ -868,6 +877,10 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
 
     gen_metadata = {"tool_call_count": len(output.get("tool_calls", [])) or assistant_tool_call_count,
                     **_duration_meta(api_duration), **({"finish_reason": finish_reason} if finish_reason else {})}
+    completion_start_time = _completion_start_time(first_chunk_at)
+    if completion_start_time is not None:
+        with _failsafe("completion_start_time"):
+            generation.update(completion_start_time=completion_start_time)
     _end_observation(generation, output=output, usage_details=usage_details, cost_details=cost_details, metadata=gen_metadata)
 
     has_tools = bool(getattr(assistant_message, "tool_calls", None)) if assistant_message else assistant_tool_call_count > 0
