@@ -1,6 +1,7 @@
 """Tests for the bundled observability/langfuse plugin."""
 from __future__ import annotations
 
+import contextlib
 import importlib
 import logging
 import sys
@@ -2259,3 +2260,311 @@ class TestCanonicalCostExport:
         # explicit zeros are treated as authoritative by Langfuse and block
         # its own model-based estimation (#43129).
         assert response_cost == {}
+
+
+# ---------------------------------------------------------------------------
+# Capture-quality fixes: system prompt survives the message window, stable
+# generation names, TTFT, SDK-v4 trace I/O, release default, subagent type,
+# and auxiliary-call tracing.
+# ---------------------------------------------------------------------------
+
+def _fresh_langfuse():
+    sys.modules.pop("plugins.observability.langfuse", None)
+    return importlib.import_module("plugins.observability.langfuse")
+
+
+class _RecObs:
+    """Records the kwargs of start_observation / update / end for one observation."""
+
+    def __init__(self, kw=None):
+        self.kw = kw or {}
+        self.updates: list = []
+        self.ended = False
+        self.children: list = []
+
+    def update(self, **kw):
+        self.updates.append(kw)
+
+    def end(self, **kw):
+        self.ended = True
+
+    def start_observation(self, **kw):
+        child = _RecObs(kw)
+        self.children.append(child)
+        return child
+
+    def merged(self):
+        out: dict = {}
+        for u in self.updates:
+            out.update(u)
+        return out
+
+
+class _RecClient:
+    def __init__(self):
+        self.roots: list = []
+        self.standalone: list = []
+
+    def create_trace_id(self, seed=None):
+        return f"trace::{seed}"
+
+    def start_as_current_observation(self, **kw):
+        root = _RecObs(kw)
+        self.roots.append(root)
+
+        class _CM:
+            def __enter__(self_inner):
+                return root
+
+            def __exit__(self_inner, *exc):
+                return False
+
+        return _CM()
+
+    def start_observation(self, **kw):
+        obs = _RecObs(kw)
+        self.standalone.append(obs)
+        return obs
+
+    def flush(self):
+        pass
+
+
+def _install_client(mod, monkeypatch):
+    client = _RecClient()
+    monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
+    mod._TRACE_STATE.clear()
+    mod._AUX_OBSERVATIONS.clear()
+    return client
+
+
+class TestSystemPromptSurvivesMessageWindow:
+    """Chat-completions routes keep the system prompt at messages[0]. The 12-message window used
+    to slice it off on every request longer than the window, so long sessions exported no system
+    prompt at all (observed: 0 of 195 chat_completions generations in 48h carried one)."""
+
+    def test_leading_system_message_kept_when_history_exceeds_window(self):
+        mod = _fresh_langfuse()
+        history = [{"role": "system", "content": "you are hermes"}]
+        history += [{"role": "user" if i % 2 else "assistant", "content": f"m{i}"} for i in range(30)]
+        out = mod._messages_for_langfuse_input(request_messages=history)
+        assert out[0] == {"role": "system", "content": "you are hermes"}
+        assert len(out) == 13  # system + the 12 most recent turns
+        assert out[-1]["content"] == "m29"
+        assert sum(1 for m in out if m["role"] == "system") == 1
+
+    def test_split_out_system_prompt_still_prepended(self):
+        mod = _fresh_langfuse()
+        out = mod._messages_for_langfuse_input(request_messages=[{"role": "user", "content": "hi"}],
+                                               system_prompt="from kwarg")
+        assert out[0] == {"role": "system", "content": "from kwarg"}
+
+    def test_in_band_system_wins_over_kwarg_without_duplication(self):
+        mod = _fresh_langfuse()
+        out = mod._messages_for_langfuse_input(
+            request_messages=[{"role": "system", "content": "in band"}, {"role": "user", "content": "hi"}],
+            system_prompt="kwarg copy")
+        assert [m["role"] for m in out] == ["system", "user"]
+        assert out[0]["content"] == "in band"
+
+
+class TestGenerationNamingAndTiming:
+    def _run(self, mod, *, first_chunk_at=None, started_at=None):
+        mod.on_pre_llm_request(task_id="t", session_id="s", turn_id="turn-1", model="claude-opus-5-5[1m]",
+                               provider="anthropic", base_url="https://api.anthropic.com", api_mode="chat_completions",
+                               api_call_count=17, request_messages=[{"role": "user", "content": "hi"}])
+        mod.on_post_llm_call(task_id="t", session_id="s", turn_id="turn-1", api_call_count=17,
+                             assistant_content_chars=0, assistant_tool_call_count=1,
+                             usage={"input_tokens": 3, "output_tokens": 2},
+                             first_chunk_at=first_chunk_at, started_at=started_at)
+
+    def test_generation_name_is_stable_and_index_moves_to_metadata(self, monkeypatch):
+        mod = _fresh_langfuse()
+        client = _install_client(mod, monkeypatch)
+        self._run(mod)
+        gen = client.roots[0].children[0]
+        assert gen.kw["name"] == "LLM call"
+        assert gen.kw["metadata"]["api_call_count"] == 17
+
+    def test_generation_carries_billing_basis(self, monkeypatch):
+        mod = _fresh_langfuse()
+        client = _install_client(mod, monkeypatch)
+        monkeypatch.setattr(mod, "_billing_metadata", lambda model, provider, base_url: {"billing_mode": "x", "cost_is_invoice": False})
+        self._run(mod)
+        md = client.roots[0].children[0].kw["metadata"]
+        assert md["billing_mode"] == "x" and md["cost_is_invoice"] is False
+
+    def test_first_chunk_sets_completion_start_time(self, monkeypatch):
+        import datetime as _dt
+        mod = _fresh_langfuse()
+        client = _install_client(mod, monkeypatch)
+        self._run(mod, first_chunk_at=1_790_000_001.5, started_at=1_790_000_000.0)
+        merged = client.roots[0].children[0].merged()
+        assert merged["completion_start_time"] == _dt.datetime.fromtimestamp(1_790_000_001.5, tz=_dt.timezone.utc)
+
+    def test_no_first_chunk_or_skewed_chunk_sets_nothing(self, monkeypatch):
+        mod = _fresh_langfuse()
+        for first, start in ((None, 5.0), (4.0, 5.0), (True, None)):
+            client = _install_client(mod, monkeypatch)
+            self._run(mod, first_chunk_at=first, started_at=start)
+            assert "completion_start_time" not in client.roots[0].children[0].merged()
+
+
+class TestTraceLevelIoAndIdentity:
+    def test_v4_span_without_update_trace_gets_trace_output(self, monkeypatch):
+        """Langfuse SDK v4 spans have set_trace_io and no update_trace; trace output was blank."""
+        mod = _fresh_langfuse()
+        calls = []
+
+        class _V4Root(_RecObs):
+            def set_trace_io(self, **kw):
+                calls.append(kw)
+
+        client = _install_client(mod, monkeypatch)
+        monkeypatch.setattr(client, "start_as_current_observation",
+                            lambda **kw: type("CM", (), {"__enter__": lambda s: _V4Root(kw), "__exit__": lambda s, *e: False})())
+        mod.on_pre_llm_request(task_id="t", session_id="s", turn_id="turn-v4", model="m", api_call_count=1,
+                               request_messages=[{"role": "user", "content": "q"}])
+        mod.on_post_llm_call(task_id="t", session_id="s", turn_id="turn-v4", api_call_count=1,
+                             assistant_content_chars=3, assistant_tool_call_count=0)
+        assert calls[0] == {"input": {"role": "user", "content": "q"}}
+        assert any("output" in c for c in calls)
+
+    def test_release_defaults_to_hermes_version(self, monkeypatch):
+        mod = _fresh_langfuse()
+        built = {}
+        monkeypatch.setattr(mod, "Langfuse", lambda **kw: built.update(kw) or object())
+        monkeypatch.setattr(mod, "_secret", lambda name: {"HERMES_LANGFUSE_PUBLIC_KEY": "pk-lf-x",
+                                                          "HERMES_LANGFUSE_SECRET_KEY": "sk-lf-y"}.get(name, ""))
+        monkeypatch.setattr(mod, "_hermes_release", lambda: "v9.9.9")
+        mod._build_client()
+        assert built["release"] == "v9.9.9"
+
+    def test_explicit_release_wins(self, monkeypatch):
+        mod = _fresh_langfuse()
+        built = {}
+        monkeypatch.setattr(mod, "Langfuse", lambda **kw: built.update(kw) or object())
+        monkeypatch.setattr(mod, "_secret", lambda name: {"HERMES_LANGFUSE_PUBLIC_KEY": "pk-lf-x",
+                                                          "HERMES_LANGFUSE_SECRET_KEY": "sk-lf-y",
+                                                          "HERMES_LANGFUSE_RELEASE": "pinned"}.get(name, ""))
+        monkeypatch.setattr(mod, "_hermes_release", lambda: "v9.9.9")
+        mod._build_client()
+        assert built["release"] == "pinned"
+
+    def test_user_id_propagates_when_configured(self, monkeypatch):
+        mod = _fresh_langfuse()
+        seen = {}
+
+        @contextlib.contextmanager
+        def fake_propagate(**kw):
+            seen.update(kw)
+            yield
+
+        monkeypatch.setattr(mod, "propagate_attributes", fake_propagate)
+        monkeypatch.setenv("HERMES_LANGFUSE_USER_ID", "tojo")
+        _install_client(mod, monkeypatch)
+        mod.on_pre_llm_request(task_id="t", session_id="s", turn_id="turn-u", model="m", api_call_count=1,
+                               request_messages=[{"role": "user", "content": "q"}])
+        assert seen["user_id"] == "tojo"
+
+
+class TestSubagentObservationType:
+    def test_subagent_is_an_agent_observation(self, monkeypatch):
+        mod = _fresh_langfuse()
+        client = _install_client(mod, monkeypatch)
+        mod.on_pre_llm_request(task_id="t", session_id="s", turn_id="turn-7", model="m", api_call_count=1,
+                               request_messages=[{"role": "user", "content": "q"}])
+        mod.on_subagent_start(parent_turn_id="turn-7", child_session_id="c1", child_role="researcher", child_goal="g")
+        sub = [c for c in client.roots[0].children if c.kw["name"].startswith("Subagent")][0]
+        assert sub.kw["as_type"] == "agent"
+
+
+class TestAuxiliaryCallTracing:
+    def _pre(self, mod, **over):
+        kw = dict(aux_task="compression", session_id="s", turn_id="", api_request_id="", retry_count=0,
+                  model="glm-5.3", provider="zai", base_url="https://api.z.ai", api_mode="chat_completions",
+                  streaming=False, started_at=100.0, message_count=2,
+                  request_messages=[{"role": "system", "content": "summarize"}, {"role": "user", "content": "long"}],
+                  system_prompt="summarize", tool_count=0, approx_input_tokens=10, max_tokens=512)
+        kw.update(over)
+        mod.on_pre_auxiliary_call(**kw)
+
+    def _post(self, mod, **over):
+        kw = dict(aux_task="compression", api_request_id="", retry_count=0, model="glm-5.3", provider="zai",
+                  base_url="https://api.z.ai", api_mode="chat_completions", streaming=False, started_at=100.0,
+                  api_duration=1.2, error=None, error_type=None, finish_reason="stop", response_model="glm-5.3",
+                  usage={"input_tokens": 40, "output_tokens": 8},
+                  response={"assistant_message": {"role": "assistant", "content": "short", "tool_calls": []}},
+                  assistant_tool_call_count=0)
+        kw.update(over)
+        mod.on_post_auxiliary_call(**kw)
+
+    def test_register_subscribes_aux_hooks(self):
+        mod = _fresh_langfuse()
+        names = []
+        mod.register(SimpleNamespace(register_hook=lambda name, fn: names.append(name)))
+        assert {"pre_auxiliary_call", "post_auxiliary_call"} <= set(names)
+
+    def test_turnless_aux_call_is_its_own_generation(self, monkeypatch):
+        mod = _fresh_langfuse()
+        client = _install_client(mod, monkeypatch)
+        self._pre(mod)
+        self._post(mod)
+        assert len(client.standalone) == 1
+        gen = client.standalone[0]
+        assert gen.kw["name"] == "Auxiliary: compression"
+        assert gen.kw["as_type"] == "generation"
+        assert gen.kw["model"] == "glm-5.3"
+        assert gen.kw["input"][0] == {"role": "system", "content": "summarize"}
+        merged = gen.merged()
+        assert merged["output"]["content"] == "short"
+        assert merged["usage_details"]["input"] == 40 and merged["usage_details"]["output"] == 8
+        assert gen.ended
+        assert not mod._AUX_OBSERVATIONS
+
+    def test_aux_call_inside_turn_nests_under_turn(self, monkeypatch):
+        mod = _fresh_langfuse()
+        client = _install_client(mod, monkeypatch)
+        mod.on_pre_llm_request(task_id="t", session_id="s", turn_id="turn-9", model="m", api_call_count=1,
+                               request_messages=[{"role": "user", "content": "q"}])
+        self._pre(mod, turn_id="turn-9", aux_task="vision")
+        self._post(mod, aux_task="vision")
+        names = [c.kw["name"] for c in client.roots[0].children]
+        assert "Auxiliary: vision" in names
+        assert client.standalone == []
+
+    def test_aux_error_marks_generation_error(self, monkeypatch):
+        mod = _fresh_langfuse()
+        client = _install_client(mod, monkeypatch)
+        self._pre(mod)
+        self._post(mod, error="TimeoutError: slow", error_type="TimeoutError", usage=None, response=None)
+        merged = client.standalone[0].merged()
+        assert merged["level"] == "ERROR"
+        assert merged["metadata"]["error_type"] == "TimeoutError"
+
+    def test_unmatched_post_is_ignored_and_retries_are_distinct(self, monkeypatch):
+        mod = _fresh_langfuse()
+        client = _install_client(mod, monkeypatch)
+        self._post(mod)  # no pre: must not raise or create anything
+        self._pre(mod, retry_count=0, started_at=1.0)
+        self._pre(mod, retry_count=1, started_at=2.0)
+        assert len(mod._AUX_OBSERVATIONS) == 2
+        self._post(mod, retry_count=1, started_at=2.0)
+        assert len(mod._AUX_OBSERVATIONS) == 1
+        assert client.standalone[1].ended and not client.standalone[0].ended
+
+    def test_pending_aux_observations_are_bounded(self, monkeypatch):
+        mod = _fresh_langfuse()
+        client = _install_client(mod, monkeypatch)
+        monkeypatch.setattr(mod, "_MAX_AUX_OBSERVATIONS", 4)
+        for i in range(10):
+            self._pre(mod, started_at=float(i))
+        assert len(mod._AUX_OBSERVATIONS) == 4
+        assert all(o.ended for o in client.standalone[:6])
+
+    def test_aux_hooks_inert_without_client(self, monkeypatch):
+        mod = _fresh_langfuse()
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: None)
+        self._pre(mod)
+        self._post(mod)
+        assert not mod._AUX_OBSERVATIONS
