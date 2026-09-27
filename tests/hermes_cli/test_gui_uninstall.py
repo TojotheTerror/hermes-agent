@@ -60,6 +60,9 @@ def test_uninstall_removes_launcher_entry_and_refreshes_cache(tmp_path, monkeypa
     entry = lde.desktop_entry_path()
     entry.parent.mkdir(parents=True, exist_ok=True)
     entry.write_text("x", encoding="utf-8")
+    # A launcher-management opt-out keeps the pre-rename entry; uninstall still owns it.
+    legacy = entry.parent / lde.LEGACY_DESKTOP_ENTRY_NAME
+    legacy.write_text("x", encoding="utf-8")
 
     refreshed: list[Path] = []
     monkeypatch.setattr(
@@ -76,6 +79,7 @@ def test_uninstall_removes_launcher_entry_and_refreshes_cache(tmp_path, monkeypa
     removed = gu.uninstall_gui(hermes_home)
 
     assert entry in removed and not entry.exists()
+    assert legacy in removed and not legacy.exists()
     assert refreshed == [entry.parent]
     # The icon lives in the checkout. A GUI uninstall must not delete it.
     assert lde.icon_path(hermes_home / "hermes-agent").exists()
