@@ -35,15 +35,30 @@ hermes plugins list                 # observability/langfuse should show "enable
 hermes chat -q "hello"              # then check Langfuse for a "Hermes turn" trace
 ```
 
-Generation observations include the Hermes system prompt when the provider
-uses a separate `system` param (Anthropic Messages API). Open an **LLM call**
-child span to inspect `role: system` (truncated via `HERMES_LANGFUSE_MAX_CHARS`).
+Generation observations include the Hermes system prompt, whether the provider
+takes it as a separate `system` param (Anthropic Messages API) or as the first
+message (chat completions). Open an **LLM call** observation to inspect
+`role: system` (truncated via `HERMES_LANGFUSE_MAX_CHARS`).
+
+What each trace carries:
+
+- **LLM call** generations (one stable name; the per-turn index is in
+  `metadata.api_call_count`), with usage, cost, reasoning, and time-to-first-token
+  on streamed calls.
+- **Auxiliary: <task>** generations for side calls such as compression, titles,
+  vision, and memory. They nest under the active turn, or form their own
+  `Hermes auxiliary` trace when no turn is running.
+- **Subagent: <role>** observations typed `agent`.
+- `metadata.billing_mode` / `cost_is_invoice: false`: Langfuse costs are
+  list-price equivalents, not invoices (subscription or local routes still show
+  an API-equivalent figure if a price is defined).
 
 ## Optional tuning
 
 ```bash
 HERMES_LANGFUSE_ENV=production       # environment tag
-HERMES_LANGFUSE_RELEASE=v1.0.0       # release tag
+HERMES_LANGFUSE_RELEASE=v1.0.0       # release tag (default: running Hermes version)
+HERMES_LANGFUSE_USER_ID=alice        # trace user id (default: unset)
 HERMES_LANGFUSE_SAMPLE_RATE=0.5      # sample 50% of traces
 HERMES_LANGFUSE_MAX_CHARS=12000      # max chars per field (default: 12000)
 HERMES_LANGFUSE_MAX_DEPTH=4          # max payload depth (default: 4)

@@ -2,7 +2,8 @@
 
 Activated via ``plugins.enabled``; hooks are inert without the ``langfuse`` SDK
 and credentials. Env: HERMES_LANGFUSE_PUBLIC_KEY / SECRET_KEY (required),
-BASE_URL, ENV, RELEASE, SAMPLE_RATE, MAX_CHARS (12000), MAX_DEPTH (4), DEBUG, and CAPTURE =
+BASE_URL, ENV, RELEASE (default: running Hermes version), USER_ID, SAMPLE_RATE,
+MAX_CHARS (12000), MAX_DEPTH (4), DEBUG, and CAPTURE =
 metadata (sizes/ids/usage only) | sanitized (default: secret redaction +
 truncation) | full (truncated raw content). See README.md.
 """
@@ -10,6 +11,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import datetime
 import functools
 import json
 import logging
@@ -239,6 +241,36 @@ def _get_langfuse() -> Optional[Langfuse]:
     return None if settled is _INIT_FAILED else settled
 
 
+@functools.lru_cache(maxsize=1)
+def _hermes_release() -> str:
+    """Running Hermes build for the Langfuse ``release`` field ('' when unknown)."""
+    try:
+        from hermes_cli.version_info import get_version_info
+
+        info = get_version_info()
+    except Exception:
+        return ""
+    release = info.display_version or info.derived_version or ""
+    return "" if release == "unknown" else release
+
+
+def _hermes_user_id() -> str:
+    """Optional Langfuse ``user_id`` (``HERMES_LANGFUSE_USER_ID``); unset leaves users unattributed."""
+    return _env("HERMES_LANGFUSE_USER_ID") or _env("LANGFUSE_USER_ID")
+
+
+def _billing_metadata(model: str, provider: str, base_url: str) -> Dict[str, Any]:
+    """How a generation is paid for, so Langfuse cost figures on subscription or unknown routes are
+    read as API-list-price equivalents rather than invoices."""
+    try:
+        from agent.usage_pricing import resolve_billing_route
+
+        mode = getattr(resolve_billing_route(model, provider=provider, base_url=base_url), "billing_mode", "") or ""
+    except Exception:
+        return {}
+    return {"billing_mode": mode, "cost_is_invoice": False} if mode else {}
+
+
 def _build_client() -> Optional[Langfuse]:
     """Construct the SDK client from env, or None (with one warning) when it can't be."""
     if Langfuse is None:
@@ -275,6 +307,12 @@ def _build_client() -> Optional[Langfuse]:
         value = _secret(f"HERMES_LANGFUSE_{name}") or _secret(f"LANGFUSE_{name}") or default
         if value:
             kwargs[key] = value
+    # Without an explicit release every trace is unversioned, so regressions can't be
+    # bisected in Langfuse; default to the running Hermes build.
+    if "release" not in kwargs:
+        release = _hermes_release()
+        if release:
+            kwargs["release"] = release
     sample_rate = _secret("HERMES_LANGFUSE_SAMPLE_RATE")
     if sample_rate:
         try:
@@ -454,7 +492,14 @@ def _messages_for_langfuse_input(*, request_messages: Any = None, messages: Any 
     """Generation input, prepending ``system_prompt`` when the provider split it out of messages."""
     raw = _coerce_request_messages(request_messages=request_messages, messages=messages,
                                    conversation_history=conversation_history, user_message=user_message)
-    system_msg = None if raw and raw[0].get("role") == "system" else _serialize_system_prompt(system_prompt)
+    # An in-band leading system message is lifted out BEFORE the recent-message window is
+    # applied: otherwise any request longer than the window silently loses its system prompt
+    # (chat-completions routes keep it at messages[0], so it is the first thing sliced off).
+    if raw and isinstance(raw[0], dict) and raw[0].get("role") == "system":
+        system_msg = _serialize_message(raw[0])
+        raw = raw[1:]
+    else:
+        system_msg = _serialize_system_prompt(system_prompt)
     serialized = _serialize_messages(raw)
     return serialized if system_msg is None else [system_msg, *serialized]
 
@@ -583,21 +628,31 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         return ctx, ctx.__enter__()
 
     root_ctx = root_span = None
+    user_id = _hermes_user_id()
     if propagate_attributes is not None:
         try:
             with propagate_attributes(session_id=session_id or task_key, trace_name="Hermes turn",
-                                      tags=["hermes", "langfuse"]):
+                                      tags=["hermes", "langfuse"], user_id=user_id or None):
                 root_ctx, root_span = open_root()
         except Exception:
             root_ctx = None
     if root_ctx is None:
         root_ctx, root_span = open_root()
 
-    with _failsafe("update_trace(input)"):  # SDK v3 uses update_trace()
-        root_span.update_trace(input=trace_input)
+    _set_trace_io(root_span, input=trace_input)
 
     _debug(f"started trace {trace_id} for {task_key}")
     return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span)
+
+
+def _set_trace_io(span: Any, **io: Any) -> None:
+    """Set TRACE-level input/output. SDK v3 spans expose ``update_trace``; v4 dropped it for
+    ``set_trace_io``. Calling only the v3 name on v4 raised inside ``_failsafe`` and silently left
+    every trace's Output column empty."""
+    method = getattr(span, "update_trace", None) or getattr(span, "set_trace_io", None)
+    if callable(method):
+        with _failsafe("trace io"):
+            method(**io)
 
 
 def _start_child_observation(state: TraceState, *, name: str, as_type: str, input_value: Any,
@@ -646,6 +701,10 @@ def _finalize_all_traces() -> None:
     with _STATE_LOCK:
         states = list(_TRACE_STATE.items())
         _TRACE_STATE.clear()
+        pending_aux = list(_AUX_OBSERVATIONS.values())
+        _AUX_OBSERVATIONS.clear()
+    for observation in pending_aux:
+        _end_observation(observation)
     for key, state in states:
         with _failsafe(f"atexit finalize for {key}"):  # _end_root never raises
             _end_children(state, include_subagents=True)
@@ -679,11 +738,11 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
             final_output = dict(output) if isinstance(output, dict) else {"content": output}
             final_output["tool_calls"] = list(state.turn_tool_calls)
         if final_output is not None:
-            # update_trace sets TRACE-level I/O (SDK v3); root I/O via update().
+            # Trace-level I/O (SDK v3 update_trace / v4 set_trace_io) and root I/O via update().
             # Neither may prevent end(), else children export without a root.
-            for method, label in (("update_trace", "update_trace(output)"), ("update", "root update(output)")):
-                with _failsafe(label):
-                    getattr(state.root_span, method)(output=final_output)
+            _set_trace_io(state.root_span, output=final_output)
+            with _failsafe("root update(output)"):
+                state.root_span.update(output=final_output)
         _end_root(state, "root end()")
     except Exception as exc:  # pragma: no cover - fail-open
         _debug(f"finish trace failed: {exc}")
@@ -707,6 +766,17 @@ def _client_and_key(task_id: str, session_id: str, turn_id: str, api_request_id:
 
 def _duration_meta(api_duration: Any) -> Dict[str, Any]:
     return {"api_duration_s": round(api_duration, 3)} if api_duration and api_duration > 0 else {}
+
+
+def _mark_first_token(observation: Any, first_chunk_at: Any, started_at: Any = None) -> None:
+    """Record time-to-first-token (``completion_start_time``) from the first stream chunk (epoch s).
+    Skipped when unstreamed, or when the chunk predates the request (stale value from a prior call)."""
+    if observation is None or not isinstance(first_chunk_at, float) or first_chunk_at <= 0:
+        return
+    if isinstance(started_at, (int, float)) and first_chunk_at < started_at:
+        return
+    with _failsafe("completion_start_time update"):
+        observation.update(completion_start_time=datetime.datetime.fromtimestamp(first_chunk_at, tz=datetime.timezone.utc))
 
 
 def _pop_generation(task_key: str, api_call_count: Any) -> tuple[Optional[TraceState], Any]:
@@ -814,10 +884,14 @@ def on_pre_llm_request(*, task_id: str = "", session_id: str = "", platform: str
         gen_metadata = {
             "provider": provider, "platform": platform, "api_mode": api_mode, "base_url": base_url,
             "message_count": message_count, "approx_input_tokens": approx_input_tokens,
+            "api_call_count": api_call_count,
             **({"system_prompt_chars": system_chars} if system_chars else {}),
+            **_billing_metadata(model, provider, base_url),
         }
+        # A stable name groups generations across turns in Langfuse; the per-turn call index
+        # lives in metadata (``LLM call 17`` fragmented every dashboard by index).
         state.generations[req_key] = _start_child_observation(
-            state, name=f"LLM call {api_call_count}", as_type="generation",
+            state, name="LLM call", as_type="generation",
             input_value=langfuse_input, metadata=gen_metadata, model=model,
             model_parameters={"api_mode": api_mode, "provider": provider},
         )
@@ -828,7 +902,8 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
                      response: Any = None, api_duration: float = 0.0, finish_reason: str = "", usage: Any = None,
                      assistant_content_chars: int = 0, assistant_tool_call_count: int = 0,
                      assistant_response: Any = None, turn_id: str = "", api_request_id: str = "",
-                     response_model: Any = None, moa_references: Any = None, **_: Any) -> None:
+                     response_model: Any = None, moa_references: Any = None,
+                     first_chunk_at: Any = None, started_at: Any = None, **_: Any) -> None:
     client, task_key = _client_and_key(task_id, session_id, turn_id, api_request_id)
     if client is None:
         return
@@ -868,6 +943,7 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
 
     gen_metadata = {"tool_call_count": len(output.get("tool_calls", [])) or assistant_tool_call_count,
                     **_duration_meta(api_duration), **({"finish_reason": finish_reason} if finish_reason else {})}
+    _mark_first_token(generation, first_chunk_at, started_at)
     _end_observation(generation, output=output, usage_details=usage_details, cost_details=cost_details, metadata=gen_metadata)
 
     has_tools = bool(getattr(assistant_message, "tool_calls", None)) if assistant_message else assistant_tool_call_count > 0
@@ -964,6 +1040,106 @@ def on_api_request_error(*, task_id: str = "", session_id: str = "", api_call_co
         state.last_updated_at = time.time()
 
 
+_AUX_OBSERVATIONS: Dict[str, Any] = {}
+_MAX_AUX_OBSERVATIONS = 256
+
+
+def _aux_key(aux_task: str, started_at: Any, api_request_id: str, retry_count: Any) -> str:
+    # ``started_at`` is stamped once per provider attempt and echoed in both pre and post payloads.
+    return f"{aux_task}:{started_at!r}:{api_request_id}:{retry_count}"
+
+
+def _start_aux_observation(client: Any, *, name: str, session_id: str, turn_id: str, input_value: Any,
+                           metadata: dict, model: str, model_parameters: dict) -> Any:
+    """Auxiliary generation under the live turn trace when there is one, else its own short trace
+    (compression, titles, vision etc. can run outside any turn: cron, gateway idle work)."""
+    with _STATE_LOCK:
+        state = _state_for_turn(turn_id)
+        if state is not None:
+            state.last_updated_at = time.time()
+            return _start_child_observation(state, name=name, as_type="generation", input_value=input_value,
+                                            metadata=metadata, model=model, model_parameters=model_parameters)
+    trace_ctx: Dict[str, Any] = {"trace_id": client.create_trace_id()}
+
+    def open_obs():
+        return client.start_observation(trace_context=trace_ctx, name=name, as_type="generation", input=input_value,
+                                        metadata=metadata, model=model, model_parameters=model_parameters)
+
+    if propagate_attributes is not None:
+        with contextlib.suppress(Exception):
+            with propagate_attributes(session_id=session_id or None, trace_name="Hermes auxiliary",
+                                      tags=["hermes", "langfuse", "auxiliary"], user_id=_hermes_user_id() or None):
+                return open_obs()
+    return open_obs()
+
+
+def on_pre_auxiliary_call(*, aux_task: str = "", session_id: str = "", turn_id: str = "", platform: str = "",
+                          api_request_id: str = "", retry_count: Any = 0, model: str = "", provider: str = "",
+                          base_url: str = "", api_mode: str = "", streaming: bool = False, started_at: Any = None,
+                          message_count: int = 0, request_messages: Any = None, system_prompt: Any = None,
+                          tool_count: int = 0, approx_input_tokens: int = 0, max_tokens: Any = None,
+                          **_: Any) -> None:
+    """Trace auxiliary LLM calls (compression, vision, titles, memory, MoA facades...) as generations;
+    without this, every non-main-loop model call was invisible and unpriced."""
+    client = _get_langfuse()
+    if client is None:
+        return
+    task = aux_task or "unknown"
+    metadata = {
+        "aux_task": task, "provider": provider, "platform": platform, "api_mode": api_mode, "base_url": base_url,
+        "streaming": bool(streaming), "retry_count": retry_count, "message_count": message_count,
+        "tool_count": tool_count, "approx_input_tokens": approx_input_tokens,
+        **({"max_tokens": max_tokens} if max_tokens else {}),
+        **_billing_metadata(model, provider, base_url),
+    }
+    with _failsafe("auxiliary generation start"):
+        observation = _start_aux_observation(
+            client, name=f"Auxiliary: {task}", session_id=session_id, turn_id=turn_id,
+            input_value=_messages_for_langfuse_input(request_messages=request_messages, system_prompt=system_prompt),
+            metadata=metadata, model=model, model_parameters={"api_mode": api_mode, "provider": provider})
+        key = _aux_key(task, started_at, api_request_id, retry_count)
+        with _STATE_LOCK:
+            stale = _AUX_OBSERVATIONS.pop(key, None)
+            _AUX_OBSERVATIONS[key] = observation
+            overflow = [_AUX_OBSERVATIONS.pop(k) for k in list(_AUX_OBSERVATIONS)[:max(0, len(_AUX_OBSERVATIONS) - _MAX_AUX_OBSERVATIONS)]]
+        for orphan in (stale, *overflow):
+            _end_observation(orphan)
+
+
+def on_post_auxiliary_call(*, aux_task: str = "", api_request_id: str = "", retry_count: Any = 0, model: str = "",
+                           provider: str = "", base_url: str = "", api_mode: str = "", streaming: bool = False,
+                           started_at: Any = None, api_duration: float = 0.0, error: Any = None,
+                           error_type: Any = None, finish_reason: Any = None, response_model: Any = None,
+                           usage: Any = None, response: Any = None, assistant_tool_call_count: int = 0,
+                           **_: Any) -> None:
+    task = aux_task or "unknown"
+    with _STATE_LOCK:
+        observation = _AUX_OBSERVATIONS.pop(_aux_key(task, started_at, api_request_id, retry_count), None)
+    if observation is None:
+        return
+    served = response_model if isinstance(response_model, str) and response_model else model
+    message = response.get("assistant_message") if isinstance(response, dict) else None
+    output = None
+    if isinstance(message, dict):
+        output = {"content": _capture_content(message.get("content")),
+                  "tool_calls": _capture_content(message.get("tool_calls") or [], parse_json_strings=True)}
+    usage_details, cost_details = ({}, {})
+    if isinstance(usage, dict) and usage:
+        usage_details, cost_details = _usage_and_cost(None, provider=provider, model=served, base_url=base_url, usage=usage)
+    metadata = {"tool_call_count": assistant_tool_call_count, **_duration_meta(api_duration),
+                **({"finish_reason": finish_reason} if finish_reason else {}),
+                **({"streamed_unconsumed": True} if streaming and error is None else {})}
+    if error:
+        metadata.update(error=True, error_type=str(error_type or ""), error_message=_capture_content(str(error)))
+        with _failsafe("auxiliary error-level update"):
+            observation.update(level="ERROR", status_message=str(error_type or "auxiliary_call_error")[:200])
+    if served and served != model:
+        with _failsafe("auxiliary served-model update"):
+            observation.update(model=served)
+    _end_observation(observation, output=output, usage_details=usage_details, cost_details=cost_details,
+                     metadata=metadata)
+
+
 def on_session_finalize(*, session_id: str = "", reason: str = "", **_: Any) -> None:
     """Session-end boundary: close still-open traces and flush. A turn ending on a
     tool-only or empty final response never reaches ``_finish_trace``; its root
@@ -1005,7 +1181,7 @@ def on_subagent_start(*, parent_turn_id: str = "", parent_subagent_id: Any = Non
         metadata = {"child_session_id": child_session_id, "child_subagent_id": child_subagent_id, "child_role": child_role,
                     **({"parent_subagent_id": parent_subagent_id} if parent_subagent_id else {})}
         state.subagents[str(child_session_id)] = _start_child_observation(
-            state, name=f"Subagent: {child_role or 'delegate'}", as_type="span",
+            state, name=f"Subagent: {child_role or 'delegate'}", as_type="agent",
             input_value=_capture_content(child_goal), metadata=metadata)
 
 
@@ -1038,7 +1214,8 @@ def register(ctx) -> None:
         ("post_llm_call", on_post_llm_call), ("pre_tool_call", on_pre_tool_call),
         ("post_tool_call", on_post_tool_call), ("on_session_finalize", on_session_finalize),
         ("on_session_end", on_session_finalize), ("subagent_start", on_subagent_start),
-        ("subagent_stop", on_subagent_stop),
+        ("subagent_stop", on_subagent_stop), ("pre_auxiliary_call", on_pre_auxiliary_call),
+        ("post_auxiliary_call", on_post_auxiliary_call),
     )
     for name, fn in hooks:
         ctx.register_hook(name, fn)
