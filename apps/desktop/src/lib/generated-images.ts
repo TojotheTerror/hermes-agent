@@ -71,11 +71,12 @@ function removeAround(
   ignoreCase = false
 ): string {
   let next = text
+  let haystack = ignoreCase ? asciiLower(next) : next
   let from = 0
   const target = ignoreCase ? asciiLower(needle) : needle
 
   for (;;) {
-    const at = (ignoreCase ? asciiLower(next) : next).indexOf(target, from)
+    const at = haystack.indexOf(target, from)
 
     if (at < 0) {
       return next
@@ -85,6 +86,7 @@ function removeAround(
 
     if (span) {
       next = next.slice(0, span.start) + next.slice(span.end)
+      haystack = ignoreCase ? asciiLower(next) : next
       from = span.start
     } else {
       from = at + 1
@@ -93,7 +95,11 @@ function removeAround(
 }
 
 function stripLongSourceEchoes(text: string, source: string): string {
-  const encoded = encodeURIComponent(source)
+  // Every echo form contains the source or its longer encoded copy, so shorter text has none. This keeps
+  // ordinary streamed deltas after an inline-image result from encoding or scanning the source at all.
+  if (text.length < source.length) {
+    return text
+  }
 
   let next = removeAround(text, source, (value, at) => {
     const before = IMAGE_BEFORE.exec(value.slice(0, at))
@@ -102,17 +108,22 @@ function stripLongSourceEchoes(text: string, source: string): string {
     return before && after ? { start: before.index, end: at + source.length + after[0].length } : null
   })
 
-  next = removeAround(
-    next,
-    encoded,
-    (value, at) => {
-      const before = MEDIA_BEFORE.exec(value.slice(0, at))
-      const after = before ? MEDIA_AFTER.exec(value.slice(at + encoded.length)) : null
+  // The #media: form only exists behind that prefix; skip encoding the source when the text has none.
+  if (/#media:/i.test(next)) {
+    const encoded = encodeURIComponent(source)
 
-      return before && after ? { start: before.index, end: at + encoded.length + after[0].length } : null
-    },
-    true
-  )
+    next = removeAround(
+      next,
+      encoded,
+      (value, at) => {
+        const before = MEDIA_BEFORE.exec(value.slice(0, at))
+        const after = before ? MEDIA_AFTER.exec(value.slice(at + encoded.length)) : null
+
+        return before && after ? { start: before.index, end: at + encoded.length + after[0].length } : null
+      },
+      true
+    )
+  }
 
   return removeAround(next, source, (value, at) => {
     const start = at > 0 && value[at - 1] === '<' ? at - 1 : at

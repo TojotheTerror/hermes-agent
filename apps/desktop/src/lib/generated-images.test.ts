@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import {
   dedupeGeneratedImageEchoesInParts,
@@ -207,6 +207,18 @@ describe('generated image echoes with an inline data: URL', () => {
     const text = 'Here is your peacock, rendered in watercolour.'
 
     expect(stripGeneratedImageEchoes(text, [dataUrl])).toBe(text)
+  })
+
+  it('does not encode the source for streamed text that cannot contain it', () => {
+    const encode = vi.spyOn(globalThis, 'encodeURIComponent')
+
+    try {
+      stripGeneratedImageEchoes('A short streamed delta.', [dataUrl])
+      stripGeneratedImageEchoes(`${'Long prose without a media link. '.repeat(20_000)}`, [dataUrl])
+      expect(encode).not.toHaveBeenCalledWith(dataUrl)
+    } finally {
+      encode.mockRestore()
+    }
   })
 
   it('removes a markdown image of the data: URL and keeps the prose around it', () => {
