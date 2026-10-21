@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import {
   dedupeGeneratedImageEchoesInParts,
@@ -195,5 +195,92 @@ describe('dedupeGeneratedImageEchoesInParts', () => {
     ]
 
     expect(dedupeGeneratedImageEchoesInParts(parts)).toEqual(parts)
+  })
+})
+
+describe('generated image echoes with an inline data: URL', () => {
+  // A data: URL this long made `new RegExp` throw "Regular expression too large" on every streamed
+  // delta once an image_generate result carried it, flooding desktop.log.
+  const dataUrl = `data:image/png;base64,${'iVBORw0KGgoAAAANSUhEUg'.repeat(20_000)}`
+
+  it('does not throw and leaves prose without the URL untouched', () => {
+    const text = 'Here is your peacock, rendered in watercolour.'
+
+    expect(stripGeneratedImageEchoes(text, [dataUrl])).toBe(text)
+  })
+
+  it('does not encode the source for streamed text that cannot contain it', () => {
+    const encode = vi.spyOn(globalThis, 'encodeURIComponent')
+
+    try {
+      stripGeneratedImageEchoes('A short streamed delta.', [dataUrl])
+      stripGeneratedImageEchoes(`${'Long prose without a media link. '.repeat(20_000)}`, [dataUrl])
+      expect(encode).not.toHaveBeenCalledWith(dataUrl)
+    } finally {
+      encode.mockRestore()
+    }
+  })
+
+  it('removes a markdown image of the data: URL and keeps the prose around it', () => {
+    expect(stripGeneratedImageEchoes(`Here you go.\n\n![Generated image](${dataUrl})\n\nEnjoy!`, [dataUrl])).toBe(
+      'Here you go.\n\n\n\nEnjoy!'
+    )
+  })
+
+  it('removes a markdown image wrapped in angle brackets with a title', () => {
+    expect(stripGeneratedImageEchoes(`A ![cat](<${dataUrl}> "title") B`, [dataUrl])).toBe('A  B')
+  })
+
+  it('removes a media link to the data: URL, matching lowercase hex too', () => {
+    const encoded = encodeURIComponent(dataUrl).replace(/%[0-9A-F]{2}/g, hex => hex.toLowerCase())
+
+    expect(stripGeneratedImageEchoes(`Saved: [Image](#media:${encoded} )`, [dataUrl])).toBe('Saved: ')
+  })
+
+  it('removes a bare occurrence and keeps the boundary character', () => {
+    expect(stripGeneratedImageEchoes(`Image: ${dataUrl}. Done`, [dataUrl])).toBe('Image: . Done')
+    expect(stripGeneratedImageEchoes(`${dataUrl} first`, [dataUrl])).toBe(' first')
+    expect(stripGeneratedImageEchoes(`[<${dataUrl}>]`, [dataUrl])).toBe('[]')
+  })
+
+  it('keeps a longer URL that merely starts with the generated one', () => {
+    const longer = `${dataUrl}AAAA`
+
+    expect(stripGeneratedImageEchoes(`![x](${longer}) and ${longer} stay`, [dataUrl])).toBe(
+      `![x](${longer}) and ${longer} stay`
+    )
+  })
+
+  it('keeps a markdown link destination intact', () => {
+    expect(stripGeneratedImageEchoes(`[label](${dataUrl})`, [dataUrl])).toBe(`[label](${dataUrl})`)
+  })
+
+  it('dedupes parts whose image_generate result carries the data: URL without throwing', () => {
+    const parts = [
+      { text: `Done!\n\n![Generated image](${dataUrl})`, type: 'text' as const },
+      { result: { image: dataUrl, success: true }, toolName: 'image_generate', type: 'tool-call' as const }
+    ]
+
+    expect(dedupeGeneratedImageEchoesInParts(parts)).toEqual([{ ...parts[0], text: 'Done!\n\n' }, parts[1]])
+  })
+
+  it('matches the RegExp path for a short source on the same inputs', () => {
+    const short = '/tmp/cat.png'
+    const long = `/tmp/${'x'.repeat(3000)}.png`
+
+    const cases = (src: string) => [
+      `![a](${src})`,
+      `![a](<${src}>)`,
+      `x ${src} y`,
+      `{${src}}`,
+      `[l](#media:${encodeURIComponent(src)})`,
+      `[l](${src})`,
+      `${src}.bak`
+    ]
+
+    const viaRegex = cases(short).map(text => stripGeneratedImageEchoes(text, [short]))
+    const viaScan = cases(long).map(text => stripGeneratedImageEchoes(text, [long]).split(long).join(short))
+
+    expect(viaScan).toEqual(viaRegex)
   })
 })

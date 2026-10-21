@@ -43,6 +43,98 @@ function regexEscape(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
+// V8 refuses a RegExp whose pattern is too large ("Regular expression too large"), and an
+// image_generate result can carry an inline `data:` URL hundreds of KB long. A source longer than
+// this is matched with plain string scans instead of a RegExp built around it; the scans keep the
+// same boundaries as the patterns in stripGeneratedImageEchoes. Real paths and URLs stay far below.
+const MAX_REGEX_SOURCE_LENGTH = 2048
+
+// The parts of each echo pattern that don't contain the source, anchored to the source's position.
+const IMAGE_BEFORE = /!\[[^\]\n]*\]\(\s*<?$/
+const IMAGE_AFTER = /^>?(?=$|[\s)\\])[^)\n]*\)/
+const MEDIA_BEFORE = /\[[^\]\n]*\]\(\s*#media:$/i
+const MEDIA_AFTER = /^\s*\)/
+const BARE_BOUNDARY = /[\s[{]/
+const BARE_AFTER = /^>?(?=$|[\s\]}.,!?])/
+
+// ASCII-only lowercase keeps every index in place (String#toLowerCase may change the length).
+function asciiLower(value: string): string {
+  return value.replace(/[A-Z]+/g, run => run.toLowerCase())
+}
+
+/** Remove every span `match` reports around an occurrence of `needle` (found with indexOf, ASCII
+ *  case-insensitively when `ignoreCase`), continuing the scan from where each removal happened. */
+function removeAround(
+  text: string,
+  needle: string,
+  match: (text: string, at: number) => { end: number; start: number } | null,
+  ignoreCase = false
+): string {
+  let next = text
+  let haystack = ignoreCase ? asciiLower(next) : next
+  let from = 0
+  const target = ignoreCase ? asciiLower(needle) : needle
+
+  for (;;) {
+    const at = haystack.indexOf(target, from)
+
+    if (at < 0) {
+      return next
+    }
+
+    const span = match(next, at)
+
+    if (span) {
+      next = next.slice(0, span.start) + next.slice(span.end)
+      haystack = ignoreCase ? asciiLower(next) : next
+      from = span.start
+    } else {
+      from = at + 1
+    }
+  }
+}
+
+function stripLongSourceEchoes(text: string, source: string): string {
+  // Every echo form contains the source or its longer encoded copy, so shorter text has none. This keeps
+  // ordinary streamed deltas after an inline-image result from encoding or scanning the source at all.
+  if (text.length < source.length) {
+    return text
+  }
+
+  let next = removeAround(text, source, (value, at) => {
+    const before = IMAGE_BEFORE.exec(value.slice(0, at))
+    const after = before ? IMAGE_AFTER.exec(value.slice(at + source.length)) : null
+
+    return before && after ? { start: before.index, end: at + source.length + after[0].length } : null
+  })
+
+  // The #media: form only exists behind that prefix; skip encoding the source when the text has none.
+  if (/#media:/i.test(next)) {
+    const encoded = encodeURIComponent(source)
+
+    next = removeAround(
+      next,
+      encoded,
+      (value, at) => {
+        const before = MEDIA_BEFORE.exec(value.slice(0, at))
+        const after = before ? MEDIA_AFTER.exec(value.slice(at + encoded.length)) : null
+
+        return before && after ? { start: before.index, end: at + encoded.length + after[0].length } : null
+      },
+      true
+    )
+  }
+
+  return removeAround(next, source, (value, at) => {
+    const start = at > 0 && value[at - 1] === '<' ? at - 1 : at
+    const after = BARE_AFTER.exec(value.slice(at + source.length))
+
+    return (start === 0 || BARE_BOUNDARY.test(value[start - 1])) && after
+      ? { start, end: at + source.length + after[0].length }
+      : null
+  })
+}
+
 function unique(values: string[]): string[] {
   return [...new Set(values.filter(Boolean))]
 }
@@ -115,6 +207,12 @@ export function stripGeneratedImageEchoes(text: string, sources: readonly string
   let next = text
 
   for (const source of unique([...sources])) {
+    if (source.length > MAX_REGEX_SOURCE_LENGTH) {
+      next = stripLongSourceEchoes(next, source)
+
+      continue
+    }
+
     const escaped = regexEscape(source)
     // Markdown image whose src is this generated source: ![alt](<src> [title]).
     // The lookahead after the escaped source stops a prefix over-match — a
