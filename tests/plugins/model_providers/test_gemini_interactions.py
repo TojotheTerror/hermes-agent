@@ -53,11 +53,16 @@ HISTORY = [
 ]
 
 
-def test_xhigh_thinking_level_reaches_the_request(gemini):
+@pytest.mark.parametrize("model", ["gemini-4-hydrogen", "gemini-4-neon"])
+def test_xhigh_thinking_level_reaches_the_request(gemini, model):
     _, wire = gemini
+    profile = providers.get_provider_profile("gemini")
+    assert profile is not None
+    extra = profile.build_extra_body(model=model, reasoning_config={"effort": "xhigh"},
+                                     base_url="https://generativelanguage.googleapis.com/v1beta")
     request = wire.build_interactions_request(
-        model="gemini-4-hydrogen", messages=[{"role": "user", "content": "hi"}],
-        thinking_config={"thinkingLevel": "xhigh", "includeThoughts": True})
+        model=model, messages=[{"role": "user", "content": "hi"}],
+        thinking_config=extra["thinking_config"])
     assert request["generation_config"]["thinking_level"] == "xhigh"
 
 

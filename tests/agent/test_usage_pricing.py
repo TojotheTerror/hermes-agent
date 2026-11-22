@@ -408,15 +408,34 @@ def test_curated_google_flash_models_resolve_official_snapshot_pricing(monkeypat
         assert model in _PROVIDER_MODELS["vertex"], model
 
 
-def test_gemini_4_hydrogen_is_pickable_and_priced(monkeypatch):
-    from hermes_cli.models_catalog_static import _PROVIDER_MODELS
-
+@pytest.mark.parametrize(
+    "model,expected_cost",
+    [
+        ("gemini-4-hydrogen", "9.075"),  # 1.50 + 7.50 + 0.075
+        ("gemini-4-neon", "18.15"),  # 3.00 + 15.00 + 0.15
+    ],
+)
+def test_gemini_4_hydrogen_and_neon_resolve_official_pricing(monkeypatch, model, expected_cost):
     monkeypatch.setattr("agent.usage_pricing.fetch_endpoint_model_metadata", lambda *_args, **_kwargs: {})
     usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000)
-    cost = estimate_usage_cost("gemini-4-hydrogen", usage, provider="gemini")
-    assert "gemini-4-hydrogen" in _PROVIDER_MODELS["gemini"] and _PROVIDER_MODELS["gemini"][0] == "gemini-3.8-flash"
+    cost = estimate_usage_cost(model, usage, provider="gemini")
     assert (cost.status, cost.source) == ("estimated", "official_docs_snapshot")
-    assert str(cost.amount_usd) == "9.075"  # 1.50 + 7.50 + 0.075
+    assert cost.amount_usd == Decimal(expected_cost)
+
+
+def test_gemini_4_catalog_entries_have_snapshot_pricing_and_stay_off_default_slot(monkeypatch):
+    from hermes_cli.models import static_catalog
+
+    monkeypatch.setattr("agent.usage_pricing.fetch_endpoint_model_metadata", lambda *_args, **_kwargs: {})
+    catalog = static_catalog("gemini")
+    assert catalog and not catalog[0].startswith("gemini-4-")
+    gemini4 = [m for m in catalog if m.startswith("gemini-4-")]
+    assert gemini4
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000)
+    for model in gemini4:
+        cost = estimate_usage_cost(model, usage, provider="gemini")
+        assert (cost.status, cost.source) == ("estimated", "official_docs_snapshot"), model
+        assert cost.amount_usd > 0, model
 
 
 def test_gemini_4_carbon_is_pickable_and_prices_like_argon(monkeypatch):
