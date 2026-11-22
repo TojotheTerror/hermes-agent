@@ -408,15 +408,23 @@ def test_curated_google_flash_models_resolve_official_snapshot_pricing(monkeypat
         assert model in _PROVIDER_MODELS["vertex"], model
 
 
-def test_gemini_4_hydrogen_is_pickable_and_priced(monkeypatch):
-    from hermes_cli.models_catalog_static import _PROVIDER_MODELS
+@pytest.mark.parametrize(
+    "model,expected_cost",
+    [
+        ("gemini-4-hydrogen", "9.075"),  # 1.50 + 7.50 + 0.075
+        ("gemini-4-neon", "18.15"),  # 3.00 + 15.00 + 0.15
+    ],
+)
+def test_gemini_4_hydrogen_and_neon_are_pickable_and_priced(monkeypatch, model, expected_cost):
+    from hermes_cli.models import static_catalog
 
     monkeypatch.setattr("agent.usage_pricing.fetch_endpoint_model_metadata", lambda *_args, **_kwargs: {})
     usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000)
-    cost = estimate_usage_cost("gemini-4-hydrogen", usage, provider="gemini")
-    assert "gemini-4-hydrogen" in _PROVIDER_MODELS["gemini"] and _PROVIDER_MODELS["gemini"][0] == "gemini-3.8-flash"
+    cost = estimate_usage_cost(model, usage, provider="gemini")
     assert (cost.status, cost.source) == ("estimated", "official_docs_snapshot")
-    assert str(cost.amount_usd) == "9.075"  # 1.50 + 7.50 + 0.075
+    assert cost.amount_usd == Decimal(expected_cost)
+    catalog = static_catalog("gemini")
+    assert model in catalog and catalog[0] == "gemini-3.8-flash"
 
 
 def test_gemini_4_carbon_is_pickable_and_prices_like_argon(monkeypatch):

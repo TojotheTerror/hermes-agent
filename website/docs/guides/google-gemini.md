@@ -184,6 +184,7 @@ The `hermes model` picker shows Gemini models maintained in Hermes' provider reg
 | Model | ID | Notes |
 |-------|----|-------|
 | Gemini 4 Hydrogen | `gemini-4-hydrogen` | Fast Gemini 4 model for everyday coding and agentic work; same window and long decode as Argon, plus an `xhigh` thinking level. Free and paid tiers |
+| Gemini 4 Neon | `gemini-4-neon` | For complex coding and knowledge work between Hydrogen and Carbon; shared 1M input+output window, long decode up to 1M output tokens, and an `xhigh` thinking level. Paid tier only |
 | Gemini 4 Carbon | `gemini-4-carbon` | Strongest reasoning model; spends more thinking per turn than Argon, with the same window, long decode and price. Paid tier only |
 | Gemini 4 Argon | `gemini-4-argon` | Flagship reasoning model; shared 1M input+output window, long decode up to 1M output tokens |
 | Gemini 3.8 Flash | `gemini-3.8-flash` | Most capable Flash model for long-horizon agentic and coding work |
@@ -201,8 +202,9 @@ Use Gemini's native model IDs such as `gemini-3.7-flash`, not OpenRouter-style I
 
 ### Gemini 4 Argon: Reasoning Effort and Long Decode
 
-Gemini 4 Carbon works the same way as Argon in everything below. Gemini 4 Argon always thinks; Hermes maps the reasoning effort (`/reasoning`,
-`agent.reasoning_effort`) onto its `thinkingLevel`:
+Gemini 4 Carbon uses the same thinking levels and total output budgets as Argon. Gemini 4 Argon
+always thinks; Hermes maps the reasoning effort (`/reasoning`, `agent.reasoning_effort`) onto its
+`thinkingLevel`:
 
 | Hermes effort | `thinkingLevel` | Total output budget |
 |---------------|-----------------|---------------------|
@@ -212,11 +214,16 @@ Gemini 4 Carbon works the same way as Argon in everything below. Gemini 4 Argon 
 | `xhigh` | `high` | 262,144 tokens (long decode) |
 | `max`, `ultra` | `high` | 1,048,576 tokens minus the input (long decode) |
 
-Gemini 4 Hydrogen has a fourth level, `xhigh`: on Hydrogen, Hermes sends `xhigh` for the
-`xhigh`, `max` and `ultra` efforts, with the same output budgets as above. Google's own default
-level for Hydrogen is `high`.
+Gemini 4 Hydrogen and Neon have a fourth level, `xhigh`: Hermes sends it for the
+`xhigh`, `max` and `ultra` efforts, with the same total output budgets as above. Google's own
+thinking levels for both are `low`, `medium`, `high` (default) and `xhigh`.
 
-Without long decode a single request stops at 65,536 output tokens when streaming
+[Gemini 4 Neon](https://aistudio.google.com/docs/models/gemini-4-neon) has a unified
+1,048,576-token input+output window. Google's synchronous output cap for Neon is 65,536 tokens,
+or up to 1,048,576 with long decode (minus the input). Its [flat paid-tier rates](https://aistudio.google.com/docs/pricing#gemini-4-neon)
+are $3.00 input, $15.00 output and $0.15 cached input per 1M tokens.
+
+On Argon and Carbon, without long decode a single request stops at 65,536 output tokens when streaming
 (32,768 non-streaming), thinking included. With `xhigh` or `max`, Hermes raises
 `maxOutputTokens` and, when a request reaches the per-request cap with budget left
 (`finishReason: CONTINUATION`), resends the same request with Google's
