@@ -415,16 +415,27 @@ def test_curated_google_flash_models_resolve_official_snapshot_pricing(monkeypat
         ("gemini-4-neon", "18.15"),  # 3.00 + 15.00 + 0.15
     ],
 )
-def test_gemini_4_hydrogen_and_neon_are_pickable_and_priced(monkeypatch, model, expected_cost):
-    from hermes_cli.models import static_catalog
-
+def test_gemini_4_hydrogen_and_neon_resolve_official_pricing(monkeypatch, model, expected_cost):
     monkeypatch.setattr("agent.usage_pricing.fetch_endpoint_model_metadata", lambda *_args, **_kwargs: {})
     usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000)
     cost = estimate_usage_cost(model, usage, provider="gemini")
     assert (cost.status, cost.source) == ("estimated", "official_docs_snapshot")
     assert cost.amount_usd == Decimal(expected_cost)
+
+
+def test_gemini_4_catalog_entries_have_snapshot_pricing_and_stay_off_default_slot(monkeypatch):
+    from hermes_cli.models import static_catalog
+
+    monkeypatch.setattr("agent.usage_pricing.fetch_endpoint_model_metadata", lambda *_args, **_kwargs: {})
     catalog = static_catalog("gemini")
-    assert model in catalog and catalog[0] == "gemini-3.8-flash"
+    assert catalog and not catalog[0].startswith("gemini-4-")
+    gemini4 = [m for m in catalog if m.startswith("gemini-4-")]
+    assert gemini4
+    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000)
+    for model in gemini4:
+        cost = estimate_usage_cost(model, usage, provider="gemini")
+        assert (cost.status, cost.source) == ("estimated", "official_docs_snapshot"), model
+        assert cost.amount_usd > 0, model
 
 
 def test_gemini_4_carbon_is_pickable_and_prices_like_argon(monkeypatch):
